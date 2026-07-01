@@ -1,0 +1,17 @@
+<launch>
+  <arg name="reference_pcd"   default="$(env HOME)/catkin_ws/maps/reference1.pcd"/>
+  <arg name="input_topic"     default="/cloud_registered"/>
+  <arg name="num_frames"      default="10"/>
+  <arg name="reference_frame" default="reference_map"/>
+
+  <node pkg="cloud_aligner" type="alignment_node.py" name="cloud_alignment_node"
+        output="screen">
+    
+    <rosparam command="load" file="$(find cloud_aligner)/config/params.yaml"/>
+
+    <param name="reference_pcd"   value="$(arg reference_pcd)"/>
+    <param name="input_topic"     value="$(arg input_topic)"/>
+    <param name="num_frames"      value="$(arg num_frames)"/>
+    <param name="reference_frame" value="$(arg reference_frame)"/>
+  </node>
+</launch>

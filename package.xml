@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>cloud_aligner</name>
+  <version>0.1.0</version>
+  <description>
+    Online point-cloud alignment: accumulate the first N /cloud_registered
+    frames from a playing bag, align them to a preloaded reference cloud
+    (FPFH + FAISS-GPU + TEASER++ + small_gicp GICP), and publish the 4x4
+    target-to-reference transform.
+  </description>
+  <maintainer email="you@example.com">you</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf</exec_depend>
+</package>

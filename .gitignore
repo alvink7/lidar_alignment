@@ -1,0 +1,23 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# ---- Point cloud data & bags----
+*.pcd
+*.bag
+*.bag.active
+maps/
+data/
+
+# ---- editor / OS noise ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+build/
+devel/
+install/

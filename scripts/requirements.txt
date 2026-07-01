@@ -1,0 +1,19 @@
+# pip dependencies for cloud_aligner.
+# Install into the SAME Python3 that ROS Noetic uses (usually /usr/bin/python3):
+#     /usr/bin/python3 -m pip install --user -r requirements.txt
+#
+# NOTE: teaserpp_python is NOT here — it has no pip package and must be built
+# from source. See SETUP.md.
+
+numpy
+open3d
+small-gicp
+
+# FAISS: GPU build. Requires a matching CUDA setup.
+# If the machine has no NVIDIA GPU / CUDA, replace with: faiss-cpu
+faiss-gpu
+
+# ---- not pip: system / ROS packages needed at runtime ----
+# tf2_ros           -> from ROS (declared in package.xml)
+# ros-noetic-pcl-ros -> apt, for visualizing the reference PCD in RViz:
+#     sudo apt install ros-noetic-pcl-ros
