@@ -38,9 +38,6 @@ class AlignParams(object):
     GROUND_PLANE_ITERS = 200
 
 
-# =============================================================================
-# Ground extraction / levelling   (Cell 10)
-# =============================================================================
 def extract_ground_and_level(pcd, dist_threshold, plane_iters, label=""):
     """Fit ground plane; return 4x4 T_level that rotates cloud upright and puts
     the ground at Z=0."""
@@ -84,9 +81,6 @@ def apply_transform(pcd, T):
     return out
 
 
-# =============================================================================
-# Ground removal / XY normalize / FPFH   (Cell 13)
-# =============================================================================
 def remove_ground_points(pcd, z_threshold):
     pts  = np.asarray(pcd.points)
     mask = pts[:, 2] > z_threshold
@@ -125,9 +119,6 @@ def make_T(tx=0, ty=0, tz=0):
     return T
 
 
-# =============================================================================
-# FAISS GPU correspondences   (Cell 13)
-# =============================================================================
 def get_correspondences_faiss(src_fpfh, tgt_fpfh, src_pcd, tgt_pcd,
                               faiss_res=None, mutual=True):
     """Mutual NN FPFH matching on GPU. Returns (src_corr, tgt_corr) as (3,N).
@@ -158,9 +149,6 @@ def get_correspondences_faiss(src_fpfh, tgt_fpfh, src_pcd, tgt_pcd,
     return src_pts.T, tgt_pts[fwd].T
 
 
-# =============================================================================
-# TEASER++   (Cell 13)
-# =============================================================================
 class TEASERResult(object):
     def __init__(self, R, t, src_corr, tgt_corr, noise_bound):
         self.transformation = np.eye(4)
@@ -191,9 +179,7 @@ def run_teaser(src_corr, tgt_corr, noise_bound, gnc_factor, max_iter):
     return sol.rotation, sol.translation
 
 
-# =============================================================================
-# small_gicp ICP   (Cell 15)
-# =============================================================================
+
 class _ICPResult(object):
     def __init__(self, T, fitness, rmse):
         self.transformation = T
@@ -221,12 +207,7 @@ def icp_pass(src, tgt, initial_transform, dist_threshold, max_iter):
     return _ICPResult(T, fitness, rmse)
 
 
-# =============================================================================
-# ICP-voxel downsample + normals   (notebook Cell 9)
-# The notebook levels and aligns the ICP_VOXEL-downsampled clouds, NOT the raw
-# clouds. Skipping this step makes segment_plane unreliable on dense raw data
-# and breaks the alignment, so it must happen before levelling.
-# =============================================================================
+
 def downsample_for_icp(pcd, params):
     down = pcd.voxel_down_sample(params.ICP_VOXEL)
     down.estimate_normals(
@@ -235,17 +216,15 @@ def downsample_for_icp(pcd, params):
     return down
 
 
-# =============================================================================
-# Reference preprocessing  -- run ONCE, cached by the node / prep script
-# =============================================================================
+# reference preprocessing
 class PreparedReference(object):
     """Everything about the reference that the per-target alignment needs,
     computed once."""
     def __init__(self, ref_cloud, params):
         self.params = params
-        # Cell 9: ICP-voxel downsample + normals BEFORE levelling
+
         ref_icp = downsample_for_icp(ref_cloud, params)
-        # Cell 10: level the downsampled cloud
+
         self.T_ref_level = extract_ground_and_level(
             ref_icp, params.GROUND_DIST_THRESHOLD,
             params.GROUND_PLANE_ITERS, label="REF")
@@ -253,7 +232,7 @@ class PreparedReference(object):
         self.ref_levelled.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(
                 radius=params.NORMAL_RADIUS, max_nn=30))
-        # ground-removed / normalized / FPFH for global registration
+
         ref_above = remove_ground_points(self.ref_levelled, params.GROUND_REMOVE_Z)
         ref_norm, self.ref_xy_ctr = normalize_xy(ref_above)
         self.ref_down, self.ref_fpfh = preprocess_for_ransac(
@@ -261,9 +240,7 @@ class PreparedReference(object):
             params.NORMAL_RADIUS_R, params.FEATURE_RADIUS_R)
 
 
-# =============================================================================
-# Full target alignment  ->  T mapping target frame into reference frame
-# =============================================================================
+# full aligment logic
 def align_target(tgt_cloud, prepared_ref, params, faiss_res=None, logger=None):
     """Returns (T_full 4x4, info dict). T_full maps points in the target's
     native frame into the reference's native frame."""

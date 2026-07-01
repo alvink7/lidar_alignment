@@ -1,3 +1,5 @@
+# PLEASE READ THE DISCLAIMER IN "USAGE.MD"
+
 # cloud_aligner
 
 ROS1 (Noetic) package that aligns a live point-cloud stream to a preloaded

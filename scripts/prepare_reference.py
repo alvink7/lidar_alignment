@@ -1,25 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-prepare_reference.py
---------------------
-One-time offline step: read the REFERENCE bag, accumulate its /cloud_registered
-frames into a single dense cloud, and save it as a PCD that alignment_node.py
-loads at startup.
-
-This keeps the reference "preloaded" — the live node never re-derives it from a
-bag. The node applies levelling/FPFH preprocessing itself (so the saved PCD is
-just the raw accumulated reference cloud in its native frame).
-
-Usage:
-  python prepare_reference.py \
-      --bag ~/catkin_ws/data/Apr4_droneparkscan.bag \
-      --topic /cloud_registered \
-      --every_nth 15 \
-      --out ~/maps/reference_prepared.pcd
-
-NOTE: "larger bag = reference" per current instruction. Point --bag at whichever
-file is the reference.
+the reference should generally be the larger bag so we don't spend more online time doing computations
 """
 
 import argparse
