@@ -1,5 +1,5 @@
 <launch>
-  <arg name="reference_pcd"   default="$(env HOME)/catkin_ws/maps/reference1.pcd"/>
+  <arg name="reference_pcd"   default="$(env HOME)/Documents/Repos/lidar_alignment/maps/reference_jul1.pcd"/>
   <arg name="input_topic"     default="/cloud_registered"/>
   <arg name="num_frames"      default="10"/>
   <arg name="reference_frame" default="reference_map"/>

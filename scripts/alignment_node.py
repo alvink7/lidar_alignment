@@ -28,11 +28,11 @@ class AlignmentNode(object):
 
         # parameters 
         self.reference_pcd_path = os.path.expanduser(rospy.get_param(
-            "~reference_pcd", "~/maps/reference_prepared.pcd"))
+            "~reference_pcd", "/home/palio/Documents/Repos/lidar_alignment/maps/reference_jul1.pcd"))
         self.input_topic = rospy.get_param("~input_topic", "/cloud_registered")
         self.output_topic = rospy.get_param("~output_topic", "/target_to_reference")
         self.matrix_topic = rospy.get_param("~matrix_topic", "/target_to_reference_matrix")
-        self.num_frames = int(rospy.get_param("~num_frames", 10))
+        self.num_frames = int(rospy.get_param("~num_frames", 50))
         self.reference_frame = rospy.get_param("~reference_frame", "reference_map")
         # target frame: read from incoming msg header, or override
         self.target_frame_override = rospy.get_param("~target_frame", "")
@@ -69,7 +69,12 @@ class AlignmentNode(object):
                       len(self.prepared_ref.ref_down.points))
 
         # persistent FAISS GPU resources (reused, not per-call) 
-        self.faiss_res = faiss.StandardGpuResources()
+        if hasattr(faiss, "StandardGpuResources") and faiss.get_num_gpus() > 0:
+            self.faiss_res = faiss.StandardGpuResources()
+            rospy.loginfo("FAISS: using GPU")
+        else:
+            self.faiss_res = None
+            rospy.loginfo("FAISS: CPU (no GPU build/device) — slower but OK")
 
         # state 
         self.frames = []

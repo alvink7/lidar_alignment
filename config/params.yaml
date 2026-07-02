@@ -1,10 +1,7 @@
 # cloud_aligner parameters
-# Edit here instead of in Python. Loaded by align.launch into the node's
-# private namespace (~param). Anything not listed falls back to the in-code
-# defaults in alignment_core.AlignParams.
 
 # ---- topics & I/O ----
-reference_pcd: "~/catkin_ws/maps/reference1.pcd"
+reference_pcd: "../scripts/maps/reference_jul1.pcd"
 input_topic: "/cloud_registered"
 output_topic: "/target_to_reference"
 matrix_topic: "/target_to_reference_matrix"
@@ -16,7 +13,7 @@ reference_frame: "reference_map"
 # ---- accumulation ----
 # Number of incoming frames to merge before aligning once.
 # Raise if the first frames are too sparse for a reliable alignment.
-num_frames: 10
+num_frames: 50
 
 # ---- pipeline tuning (override AlignParams) ----
 # Global registration
