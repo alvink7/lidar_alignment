@@ -10,7 +10,7 @@ script share ONE implementation.
 Pipeline per alignment:
     level (gravity vector OR ground plane -> Z up, ground at 0)
       -> remove ground points
-      -> normalize XY to origin
+      -> normalize XY to a SHARED origin (the reference center)
       -> FPFH features
       -> FAISS GPU mutual-NN correspondences
       -> TEASER++ global registration
@@ -34,22 +34,16 @@ import teaserpp_python
 import faiss
 import small_gicp
 
-
-# =============================================================================
-# Parameters (defaults copied from the notebook config cell).
-# The ROS node overrides these from the parameter server; the offline prep
-# script imports them directly.
-# =============================================================================
 class AlignParams(object):
     ICP_VOXEL    = 0.10
-    RANSAC_VOXEL = 0.30
+    RANSAC_VOXEL = 0.20
     VOXEL_SIZE   = 0.05
 
     GROUND_DIST_THRESHOLD = 0.15
     GROUND_REMOVE_Z       = 0.30
 
     NORMAL_RADIUS_R  = RANSAC_VOXEL * 2
-    FEATURE_RADIUS_R = RANSAC_VOXEL * 5
+    FEATURE_RADIUS_R = 1.5
 
     TEASER_NOISE_BOUND = RANSAC_VOXEL * 2.0
     TEASER_GNC_FACTOR  = 1.4
@@ -61,22 +55,18 @@ class AlignParams(object):
     NORMAL_RADIUS   = ICP_VOXEL * 2
 
     GROUND_PLANE_ITERS = 200
-    # Ground-plane search: reject planes tilted more than this from horizontal
-    # (so walls/ceilings aren't mistaken for the floor indoors), retrying up to
-    # GROUND_PLANE_ATTEMPTS times, removing found inliers each try.
     GROUND_MAX_TILT_DEG = 30.0
-    GROUND_PLANE_ATTEMPTS = 5
-    # small_gicp.align internal downsampling. 0.0 = keep our upstream resolution
-    # (clouds are already ICP_VOXEL-downsampled). Raise slightly if GICP is slow.
+    GROUND_PLANE_ATTEMPTS = 12
     GICP_DOWNSAMPLE_RES = 0.05
-    # Constrain global+refined transforms to yaw+translation in the levelled
-    # frame (pitch/roll already fixed by levelling). Removes spurious out-of-plane
-    # rotations that cause wrong/non-deterministic results on sparse targets.
     CONSTRAIN_TO_YAW = True
-    # Prefer FAST-LIO's gravity vector for levelling over a RANSAC plane fit.
-    # When a gravity vector is supplied to PreparedReference/align_target this is
-    # used automatically; the plane fit remains as fallback when it is not.
+
+
+    LEVEL_MODE = "gravity_height"
+    FLOOR_Z_PERCENTILE = 2.0
+    
     USE_GRAVITY_LEVELLING = True
+
+    XY_NORMALIZE_MODE = "reference"
 
 
 # =============================================================================
@@ -107,45 +97,48 @@ def _R_align_normal_to_z(normal):
     return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
 
 
-def _level_from_normal(pcd, normal):
+def _level_from_normal(pcd, normal, floor_percentile=2.0):
     """Build a 4x4 T_level that rotates `normal` upright to +Z and puts the
-    ground at Z=0 (2nd-percentile height in the rotated frame)."""
+    ground at Z=0 (low-percentile height in the rotated frame). The height comes
+    from the lowest-Z points, which is the deterministic floor-height estimate."""
     R = _R_align_normal_to_z(normal)
     T_level = np.eye(4)
     T_level[:3, :3] = R
     pts_rot_z = (np.asarray(pcd.points) @ R.T)[:, 2]
-    ground_z = np.percentile(pts_rot_z, 2)
+    ground_z = np.percentile(pts_rot_z, floor_percentile)
     T_level[2, 3] = -ground_z
     return T_level
 
 
 def level_from_gravity(pcd, gravity, params=None):
-    """Level using FAST-LIO's gravity vector instead of a plane fit.
+    """Level using a gravity vector instead of a plane fit."""
+    pct = getattr(params, "FLOOR_Z_PERCENTILE", 2.0) if params else 2.0
+    return _level_from_normal(
+        pcd, -np.asarray(gravity, dtype=np.float64), floor_percentile=pct)
 
-    `gravity` is the gravity direction expressed in the cloud's own frame,
-    pointing DOWN (e.g. FAST-LIO state_point.grav). up = -gravity. Fully
-    deterministic: no RANSAC, no random sampling. The ground height is still the
-    2nd-percentile of the levelled Z, which is deterministic."""
-    return _level_from_normal(pcd, -np.asarray(gravity, dtype=np.float64))
+
+def level_gravity_height(pcd, gravity=None, params=None):
+    """PRIMARY levelling for gravity-aligned (FAST-LIO) clouds."""
+    pct = getattr(params, "FLOOR_Z_PERCENTILE", 2.0) if params else 2.0
+    if gravity is not None:
+        up = -np.asarray(gravity, dtype=np.float64)
+    else:
+        up = np.array([0.0, 0.0, 1.0])     # trust gravity-alignment: no rotation
+    return _level_from_normal(pcd, up, floor_percentile=pct)
 
 
 # =============================================================================
-# Ground extraction / levelling   (Cell 10)
+# Ground extraction / levelling 
 # =============================================================================
 def _find_horizontal_plane(pcd, dist_threshold, plane_iters, params, label=""):
-    """Find the GROUND plane, not just the biggest plane. Indoors the largest
-    plane is often a wall; this rejects planes whose normal isn't near-vertical
-    and keeps searching (removing found inliers) until a horizontal plane is
-    found. Returns (normal, inlier_indices) or falls back to the biggest plane
-    if no horizontal one is found.
-
-    NOTE: RANSAC-based, so this is the non-deterministic path. Prefer
-    level_from_gravity when a gravity vector is available."""
+    
     max_tilt = getattr(params, "GROUND_MAX_TILT_DEG", 30.0)
     work = pcd
     remaining_idx = np.arange(len(pcd.points))
-    best_fallback = None
-    for attempt in range(getattr(params, "GROUND_PLANE_ATTEMPTS", 5)):
+    # track only the best HORIZONTAL candidate (by inlier count) as a tie-break;
+    # tilted planes are never eligible to be returned.
+    best_horiz = None
+    for attempt in range(getattr(params, "GROUND_PLANE_ATTEMPTS", 12)):
         if len(work.points) < 3:
             break
         pm, inl = work.segment_plane(
@@ -156,44 +149,42 @@ def _find_horizontal_plane(pcd, dist_threshold, plane_iters, params, label=""):
         if n[2] < 0:
             n = -n
         tilt = np.degrees(np.arccos(np.clip(n[2], -1.0, 1.0)))
-        # map local inliers back to original indices
-        global_inl = remaining_idx[inl]
-        if best_fallback is None or len(inl) > len(best_fallback[1]):
-            best_fallback = (n, global_inl)
+        global_inl = remaining_idx[inl]        # map back to original indices
         if tilt <= max_tilt:
-            return n, global_inl        # found the ground
-        # not horizontal: remove these inliers and search the rest
+            # horizontal: this is the floor. Keep the largest such plane.
+            if best_horiz is None or len(global_inl) > len(best_horiz[1]):
+                best_horiz = (n, global_inl)
+            return best_horiz                  # first horizontal hit is enough
+       
         mask = np.ones(len(work.points), dtype=bool)
         mask[inl] = False
         remaining_idx = remaining_idx[mask]
         work = work.select_by_index(np.where(mask)[0])
-    # no horizontal plane found. Use the largest plane we saw, or — if the cloud
-    # was too small to fit any plane — fall back to an already-level assumption
-    # (normal = +Z, no rotation) so callers never receive None.
-    if best_fallback is None:
-        return np.array([0.0, 0.0, 1.0]), np.arange(len(pcd.points))
-    return best_fallback
+    # No horizontal plane found within the attempt budget.
+    if best_horiz is not None:
+        return best_horiz
+    return np.array([0.0, 0.0, 1.0]), np.arange(len(pcd.points))
 
 
 def extract_ground_and_level(pcd, dist_threshold, plane_iters, label="",
                             params=None, gravity=None):
     """Return 4x4 T_level that rotates cloud upright and puts the ground at Z=0.
+    Behaviour is controlled by params.LEVEL_MODE:
 
-    If `gravity` is supplied (gravity direction in the cloud frame, pointing
-    DOWN — e.g. from FAST-LIO), levelling is done directly from it: deterministic,
-    no RANSAC. Otherwise falls back to the horizontal-constrained plane fit
-    (which is non-deterministic on sparse indoor clouds)."""
+    - "gravity_height": trust the fast lio gravity-alignment. """
     if params is None:
         params = AlignParams()
 
-    use_grav = getattr(params, "USE_GRAVITY_LEVELLING", True)
-    if gravity is not None and use_grav:
-        return level_from_gravity(pcd, gravity, params)
+    mode = getattr(params, "LEVEL_MODE", "gravity_height")
 
-    # ---- fallback: RANSAC plane fit ----
+    if mode == "gravity_height":
+        return level_gravity_height(pcd, gravity=gravity, params=params)
+
+    # ---- opt-in: RANSAC plane fit ----
     normal, inliers = _find_horizontal_plane(
         pcd, dist_threshold, plane_iters, params, label)
-    return _level_from_normal(pcd, normal)
+    pct = getattr(params, "FLOOR_Z_PERCENTILE", 2.0)
+    return _level_from_normal(pcd, normal, floor_percentile=pct)
 
 
 def apply_transform(pcd, T):
@@ -203,7 +194,7 @@ def apply_transform(pcd, T):
 
 
 # =============================================================================
-# Ground removal / XY normalize / FPFH   (Cell 13)
+# Ground removal / XY normalize / FPFH 
 # =============================================================================
 def remove_ground_points(pcd, z_threshold):
     pts  = np.asarray(pcd.points)
@@ -217,12 +208,25 @@ def remove_ground_points(pcd, z_threshold):
     return above
 
 
-def normalize_xy(pcd):
-    ctr = pcd.get_axis_aligned_bounding_box().get_center()
+def normalize_xy(pcd, center=None):
+    """Recenter a cloud in XY by subtracting `center` (a length-2 or length-3
+    array). If `center` is None, uses this cloud's own bbox center (only correct when a single cloud is centered in isolation).
+
+    Returns (recentered_pcd, center_used).."""
+    if center is None:
+        center = pcd.get_axis_aligned_bounding_box().get_center()
+    center = np.asarray(center, dtype=np.float64)
     T = np.eye(4)
-    T[0, 3] = -ctr[0]
-    T[1, 3] = -ctr[1]
-    return apply_transform(pcd, T), ctr
+    T[0, 3] = -center[0]
+    T[1, 3] = -center[1]
+    return apply_transform(pcd, T), center
+
+
+def _resolve_feature_radius(params):
+    fr = getattr(params, "FEATURE_RADIUS_R", None)
+    if fr is None:
+        fr = params.RANSAC_VOXEL * 5
+    return fr
 
 
 def preprocess_for_ransac(pcd, voxel, normal_r, feature_r):
@@ -262,7 +266,7 @@ def constrain_to_yaw(T):
 
 
 # =============================================================================
-# FAISS GPU correspondences   (Cell 13)
+# FAISS GPU correspondences 
 # =============================================================================
 def _faiss_supports_gpu():
     """True if this faiss build has GPU support AND a GPU is visible."""
@@ -275,11 +279,7 @@ def _faiss_supports_gpu():
 
 def get_correspondences_faiss(src_fpfh, tgt_fpfh, src_pcd, tgt_pcd,
                               faiss_res=None, mutual=True):
-    """Mutual NN FPFH matching. Returns (src_corr, tgt_corr) as (3,N).
-    Uses the GPU if this faiss build supports it and a GPU is present;
-    otherwise falls back to a CPU IndexFlatL2. Pass a persistent
-    faiss.StandardGpuResources() in faiss_res to avoid re-allocating GPU
-    scratch each call (ignored on CPU)."""
+    """Mutual NN FPFH matching. Returns (src_corr, tgt_corr) as (3,N)."""
     src_feat = np.ascontiguousarray(np.array(src_fpfh.data).T, dtype=np.float32)
     tgt_feat = np.ascontiguousarray(np.array(tgt_fpfh.data).T, dtype=np.float32)
     src_pts  = np.asarray(src_pcd.points)
@@ -309,7 +309,7 @@ def get_correspondences_faiss(src_fpfh, tgt_fpfh, src_pcd, tgt_pcd,
 
 
 # =============================================================================
-# TEASER++   (Cell 13)
+# TEASER++
 # =============================================================================
 class TEASERResult(object):
     def __init__(self, R, t, src_corr, tgt_corr, noise_bound):
@@ -342,7 +342,7 @@ def run_teaser(src_corr, tgt_corr, noise_bound, gnc_factor, max_iter):
 
 
 # =============================================================================
-# small_gicp ICP   (Cell 15)
+# small_gicp ICP
 # =============================================================================
 class _ICPResult(object):
     def __init__(self, T, fitness, rmse):
@@ -382,10 +382,7 @@ def icp_pass(src, tgt, initial_transform, dist_threshold, max_iter):
 
 
 # =============================================================================
-# ICP-voxel downsample + normals   (notebook Cell 9)
-# The notebook levels and aligns the ICP_VOXEL-downsampled clouds, NOT the raw
-# clouds. Skipping this step makes segment_plane unreliable on dense raw data
-# and breaks the alignment, so it must happen before levelling.
+# ICP-voxel downsample + normals 
 # =============================================================================
 def downsample_for_icp(pcd, params):
     down = pcd.voxel_down_sample(params.ICP_VOXEL)
@@ -394,16 +391,13 @@ def downsample_for_icp(pcd, params):
             radius=params.NORMAL_RADIUS, max_nn=30))
     return down
 
-
-# =============================================================================
-# Reference preprocessing  -- run ONCE, cached by the node / prep script
-# =============================================================================
+# Reference preprocessing
 class PreparedReference(object):
     """Everything about the reference that the per-target alignment needs,
     computed once.
 
     Pass `gravity` (gravity direction in the reference cloud's frame, pointing
-    DOWN — from FAST-LIO) to level the reference deterministically. The
+    DOWN -- from FAST-LIO) to level the reference deterministically. The
     reference and each target have different camera_init origins, so each MUST
     be levelled with its OWN gravity vector; the reference's is captured here."""
     def __init__(self, ref_cloud, params, gravity=None):
@@ -423,22 +417,31 @@ class PreparedReference(object):
                 radius=params.NORMAL_RADIUS, max_nn=30))
         # ground-removed / normalized / FPFH for global registration
         ref_above = remove_ground_points(self.ref_levelled, params.GROUND_REMOVE_Z)
-        ref_norm, self.ref_xy_ctr = normalize_xy(ref_above)
+
+        # XY normalization: record the reference center so the TARGET can be
+        # recentered by the SAME value (see XY_NORMALIZE_MODE). This is the fix
+        # for the bbox-center bug: never let the two clouds use different centers.
+        xy_mode = getattr(params, "XY_NORMALIZE_MODE", "reference")
+        if xy_mode == "none":
+            self.ref_xy_ctr = np.zeros(3)
+            ref_norm = ref_above
+        else:
+            ref_norm, self.ref_xy_ctr = normalize_xy(ref_above, center=None)
+
+        feat_r = _resolve_feature_radius(params)
         self.ref_down, self.ref_fpfh = preprocess_for_ransac(
             ref_norm, params.RANSAC_VOXEL,
-            params.NORMAL_RADIUS_R, params.FEATURE_RADIUS_R)
+            params.NORMAL_RADIUS_R, feat_r)
 
 
-# =============================================================================
 # Full target alignment  ->  T mapping target frame into reference frame
-# =============================================================================
 def align_target(tgt_cloud, prepared_ref, params, faiss_res=None, logger=None,
                  gravity=None):
     """Returns (T_full 4x4, info dict). T_full maps points in the target's
     native frame into the reference's native frame.
 
     Pass `gravity` (gravity direction in the TARGET cloud's own frame, pointing
-    DOWN — from FAST-LIO, ideally sampled at the END of the accumulation window
+    DOWN -- from FAST-LIO, ideally sampled at the END of the accumulation window
     when the estimate has converged). This levels the target deterministically,
     removing the RANSAC plane fit and its run-to-run variation. If omitted, the
     plane-fit fallback is used."""
@@ -451,10 +454,10 @@ def align_target(tgt_cloud, prepared_ref, params, faiss_res=None, logger=None,
     info["used_gravity_levelling"] = bool(
         grav is not None and getattr(params, "USE_GRAVITY_LEVELLING", True))
 
-    # Cell 9: ICP-voxel downsample + normals BEFORE levelling (matches notebook)
+    # ICP-voxel downsample + normals
     tgt_icp = downsample_for_icp(tgt_cloud, params)
 
-    # 1. level the target (gravity if available, else plane fit)
+    # level the target (gravity if available, else plane fit)
     T_tgt_level = extract_ground_and_level(
         tgt_icp, params.GROUND_DIST_THRESHOLD,
         params.GROUND_PLANE_ITERS, label="TGT", params=params, gravity=grav)
@@ -463,16 +466,34 @@ def align_target(tgt_cloud, prepared_ref, params, faiss_res=None, logger=None,
         o3d.geometry.KDTreeSearchParamHybrid(
             radius=params.NORMAL_RADIUS, max_nn=30))
 
-    # 2. ground-remove + normalize + FPFH
+    # ground-remove + normalize + FPFH
     tgt_above = remove_ground_points(tgt_levelled, params.GROUND_REMOVE_Z)
-    tgt_norm, tgt_xy_ctr = normalize_xy(tgt_above)
+
+    # XY normalization: recenter the target by the SAME center used
+    # for the reference (or skip entirely), NOT by the target's own bbox center.
+    # Using each cloud's own bbox center injects a spurious relative offset when
+    # the clouds cover different regions (partial overlap), which fights TEASER.
+    xy_mode = getattr(params, "XY_NORMALIZE_MODE", "reference")
+    if xy_mode == "none":
+        tgt_norm = tgt_above
+        tgt_xy_ctr = np.zeros(3)
+        shared_ctr = np.zeros(3)
+    elif xy_mode == "self":
+        tgt_norm, tgt_xy_ctr = normalize_xy(tgt_above, center=None)
+        shared_ctr = prepared_ref.ref_xy_ctr
+    else:  # "reference" (default): both clouds recentered by the reference center
+        shared_ctr = prepared_ref.ref_xy_ctr
+        tgt_norm, tgt_xy_ctr = normalize_xy(tgt_above, center=shared_ctr)
+
+    feat_r = _resolve_feature_radius(params)
     tgt_down, tgt_fpfh = preprocess_for_ransac(
         tgt_norm, params.RANSAC_VOXEL,
-        params.NORMAL_RADIUS_R, params.FEATURE_RADIUS_R)
-    log("FPFH: ref=%d tgt=%d pts" %
-        (len(prepared_ref.ref_down.points), len(tgt_down.points)))
+        params.NORMAL_RADIUS_R, feat_r)
+    log("FPFH: ref=%d tgt=%d pts (xy_mode=%s, feat_r=%.2f)" %
+        (len(prepared_ref.ref_down.points), len(tgt_down.points),
+         xy_mode, feat_r))
 
-    # 3. FAISS correspondences  (src=target, tgt=reference)
+    # faiss correspondences  (src=target, tgt=reference)
     src_corr, tgt_corr = get_correspondences_faiss(
         tgt_fpfh, prepared_ref.ref_fpfh, tgt_down, prepared_ref.ref_down,
         faiss_res=faiss_res, mutual=True)
@@ -483,7 +504,7 @@ def align_target(tgt_cloud, prepared_ref, params, faiss_res=None, logger=None,
         raise RuntimeError(
             "Only %d correspondences (<3). Lower RANSAC_VOXEL." % n_corr)
 
-    # 4. TEASER++ global
+    # TEASER++ global
     R_te, t_te = run_teaser(
         src_corr, tgt_corr, params.TEASER_NOISE_BOUND,
         params.TEASER_GNC_FACTOR, params.TEASER_MAX_ITER)
@@ -492,20 +513,18 @@ def align_target(tgt_cloud, prepared_ref, params, faiss_res=None, logger=None,
     info["teaser_rmse"]    = r.inlier_rmse
     log("TEASER fitness=%.4f rmse=%.4f" % (r.fitness, r.inlier_rmse))
 
-    # compose global transform in levelled frame
-    T_tgt_to_norm = make_T(-tgt_xy_ctr[0], -tgt_xy_ctr[1])
-    T_norm_to_ref = make_T(prepared_ref.ref_xy_ctr[0], prepared_ref.ref_xy_ctr[1])
+    # compose global transform in levelled frame.
+    # In "reference"/"self" modes both clouds were shifted by shared_ctr; in
+    # "none" mode shared_ctr is zero so these are identities.
+    T_tgt_to_norm = make_T(-shared_ctr[0], -shared_ctr[1])
+    T_norm_to_ref = make_T(shared_ctr[0], shared_ctr[1])
     T_global_levelled = T_norm_to_ref @ r.transformation @ T_tgt_to_norm
 
-    # Both clouds are levelled here, so the true transform is yaw + translation
-    # only. Zero out any spurious pitch/roll TEASER introduced — this removes a
-    # class of wrong, non-deterministic solutions (esp. on sparse targets) and
-    # gives GICP a cleaner starting point.
+    # zero out teaser inaccuracies
     if getattr(params, "CONSTRAIN_TO_YAW", True):
         T_global_levelled = constrain_to_yaw(T_global_levelled)
 
-    # 5. GICP refinement in levelled frame, init from TEASER
-    #    align target_levelled onto ref_levelled
+    # GICP refinement in levelled frame
     r1 = icp_pass(tgt_levelled, prepared_ref.ref_levelled, T_global_levelled,
                   params.ICP_DIST_COARSE, params.ICP_MAX_ITER)
     r2 = icp_pass(tgt_levelled, prepared_ref.ref_levelled, r1.transformation,
@@ -514,10 +533,10 @@ def align_target(tgt_cloud, prepared_ref, params, faiss_res=None, logger=None,
     info["icp_rmse"]    = r2.inlier_rmse
     log("GICP fitness=%.4f rmse=%.4fcm" % (r2.fitness, r2.inlier_rmse * 100))
 
-    # 6. compose back out of levelled frames into native frames:
+    # compose back out of levelled frames into native frames:
     #    target_native --T_tgt_level--> target_levelled --r2--> ref_levelled
     #    --inv(T_ref_level)--> ref_native
-    #    r2 is in the levelled frame, so constrain it to yaw too — GICP can
+    #    r2 is in the levelled frame, so constrain it to yaw too -- GICP can
     #    re-introduce small spurious pitch/roll during refinement.
     r2_levelled = r2.transformation
     if getattr(params, "CONSTRAIN_TO_YAW", True):

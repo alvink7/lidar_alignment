@@ -1,27 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-visualize_live_result.py
-------------------------
-Checks the transform that the LIVE ROS node published.
-
-Subscribes to /target_to_reference_matrix (latched), grabs the 4x4, applies it
-to a target PCD, and overlays it on the reference PCD:
-  blue   = reference
-  orange = target transformed by the node's published matrix
-
-This verifies the actual deployed result, not an offline recomputation.
-
-Run AFTER the node has published (the topic is latched, so timing is flexible):
-  rosrun cloud_aligner visualize_live_result.py \
-      _reference_pcd:=$HOME/catkin_ws/maps/reference1.pcd \
-      _target_pcd:=$HOME/catkin_ws/maps/test_tgt.pcd
-
-Note: the node aligned the first N live frames, which differ from a whole-bag
-target PCD. For the closest visual match, point _target_pcd at a cloud built
-from the same first frames (see --help in the node). Using the full target PCD
-still shows whether the rotation/translation is sane.
-"""
 
 import os
 import numpy as np

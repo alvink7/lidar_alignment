@@ -25,14 +25,6 @@ from ros_cloud_utils import (pointcloud2_to_o3d, accumulate_clouds,
                             matrix_to_transform_stamped)
 
 
-# =============================================================================
-# Gravity tracker — extracts the gravity vector from whatever the bag publishes
-# so levelling is deterministic (no RANSAC plane fit). Priority:
-#   1. explicit gravity topic (geometry_msgs/Vector3[Stamped])  -- best
-#   2. FAST-LIO /Odometry orientation
-#   3. raw IMU linear acceleration                              -- fallback
-# The vector is reported in the CLOUD frame, pointing DOWN.
-# =============================================================================
 class GravityTracker(object):
     def __init__(self, grav_topic="", odom_topic="/Odometry",
                  imu_topic="/livox/imu", cloud_is_world=True, imu_avg_n=100):
