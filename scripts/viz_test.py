@@ -13,10 +13,10 @@ class LiveResultViz(object):
         rospy.init_node("visualize_live_result")
         self.ref_path = os.path.expanduser(
             rospy.get_param("~reference_pcd",
-                            "~/catkin_ws/maps/reference_jul1.pcd"))
+                            "~/catkin_ws/data/maps/droneparkscan.pcd"))
         self.tgt_path = os.path.expanduser(
             rospy.get_param("~target_pcd",
-                            "~/catkin_ws/maps/test_target.pcd"))
+                            "~/catkin_ws/data/maps/palio2.pcd"))
         self.matrix_topic = rospy.get_param("~matrix_topic",
                                             "/target_to_reference_matrix")
         self.T = None

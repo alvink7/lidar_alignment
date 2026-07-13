@@ -2,28 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 alignment_core.py
------------------
-Core point-cloud alignment pipeline, extracted verbatim (in behaviour) from the
-multibag_mapping notebook so the live ROS node and the offline reference-prep
-script share ONE implementation.
-
-Pipeline per alignment:
-    level (gravity vector OR ground plane -> Z up, ground at 0)
-      -> remove ground points
-      -> normalize XY to a SHARED origin (the reference center)
-      -> FPFH features
-      -> FAISS GPU mutual-NN correspondences
-      -> TEASER++ global registration
-      -> small_gicp GICP refinement (coarse then fine)
-    => 4x4 transform mapping TARGET frame into REFERENCE frame.
-
-This module is pure Python / numpy / open3d / faiss / teaserpp_python /
-small_gicp.  It imports NOTHING from rospy, so it can be unit-tested off-robot.
-
-LEVELLING: prefer FAST-LIO's gravity vector (deterministic, no RANSAC). Pass a
-gravity vector (gravity direction in the cloud frame, pointing DOWN) into
-PreparedReference / align_target and levelling uses it directly. If no gravity
-is supplied, falls back to the horizontal-constrained plane fit.
 """
 
 import numpy as np
@@ -34,512 +12,412 @@ import teaserpp_python
 import faiss
 import small_gicp
 
+
 class AlignParams(object):
-    ICP_VOXEL    = 0.10
-    RANSAC_VOXEL = 0.20
-    VOXEL_SIZE   = 0.05
+    # ---- Voxel / feature scales (FIXED -- these are the values that worked) ----
+    ICP_VOXEL        = 0.10      # cloud used for levelling + GICP
+    NORMAL_RADIUS    = 0.20      # = ICP_VOXEL * 2
+    RANSAC_VOXEL     = 0.30      # cloud used for FPFH
+    NORMAL_RADIUS_R  = 0.60      # = RANSAC_VOXEL * 2
+    FEATURE_RADIUS_R = 1.50      # = RANSAC_VOXEL * 5
 
-    GROUND_DIST_THRESHOLD = 0.15
-    GROUND_REMOVE_Z       = 0.30
-
-    NORMAL_RADIUS_R  = RANSAC_VOXEL * 2
-    FEATURE_RADIUS_R = 1.5
-
-    TEASER_NOISE_BOUND = RANSAC_VOXEL * 2.0
+    # ---- TEASER ----
+    TEASER_NOISE_BOUND = 0.60    # = RANSAC_VOXEL * 2
     TEASER_GNC_FACTOR  = 1.4
     TEASER_MAX_ITER    = 100
 
+    # ---- GICP (coarse then fine) ----
     ICP_DIST_COARSE = 0.5
     ICP_DIST_FINE   = 0.1
     ICP_MAX_ITER    = 50
-    NORMAL_RADIUS   = ICP_VOXEL * 2
 
-    GROUND_PLANE_ITERS = 200
-    GROUND_MAX_TILT_DEG = 30.0
-    GROUND_PLANE_ATTEMPTS = 12
-    GICP_DOWNSAMPLE_RES = 0.05
-    CONSTRAIN_TO_YAW = True
+    # ---- Ground removal before feature matching ----
+    GROUND_REMOVE_Z = 0.30       # strip points below this (m) after levelling
 
+    # ---- Ground-plane levelling (found from the low-Z FLOOR points only) ----
+    # The floor is isolated in two ways before any plane is fit, so a dense wall
+    # can never capture it (that produced a ~90 deg false tilt):
+    #   * only points whose local normal is near-vertical are kept -- walls have
+    #     horizontal normals and are dropped, so even a small floor patch wins;
+    #   * among those, the floor is the LOWEST significant horizontal band, not
+    #     merely the densest (a dense table/ceiling won't outvote a sparse floor).
+    FLOOR_MAX_NORMAL_TILT_DEG = 30.0  # a point is "floor-like" if its normal is
+                                      # within this of vertical (else it's a wall)
+    MIN_FLOOR_POINTS = 30             # need this many floor-like pts to trust the
+                                      # normal filter; else fall back to all pts
+    FLOOR_SEARCH_PCT   = 40.0    # search the lowest N% of floor-like Z
+    FLOOR_SLAB_M       = 0.10    # thickness of the density slab
+    FLOOR_MIN_SLAB_FRAC = 0.40   # a slab is "the floor" at this fraction of the
+                                 # densest slab -> take the LOWEST such slab
+    FLOOR_BAND_M       = 0.50    # keep floor-like pts within +/- this of the seed
+    FLOOR_FIT_ITERS    = 5       # sigma-clipping rounds (0 = single lstsq fit)
+    FLOOR_FIT_SIGMA    = 2.5     # reject points beyond this many residual sigmas
+    # Levelling is PURE Z-SHIFT -- it NEVER rotates. The clouds are
+    # gravity-aligned, so the two floors are already parallel and differ only in
+    # height; rotating a gravity-aligned cloud only injects tilt (and worst of
+    # all on a sparse floor). The floor plane is fit only to LOCATE the floor and
+    # its height; the height is then removed with a Z translation and the plane's
+    # (small) tilt is reported for diagnostics but never applied.
 
-    LEVEL_MODE = "gravity_height"
-    FLOOR_Z_PERCENTILE = 2.0
-    
-    USE_GRAVITY_LEVELLING = True
-
-    XY_NORMALIZE_MODE = "reference"
-
-
-# =============================================================================
-# Levelling helpers
-# =============================================================================
-def _R_align_normal_to_z(normal):
-    """Rodrigues rotation mapping `normal` -> +Z. Deterministic, no sampling.
-    Shared by both the gravity path and the plane-fit path so there is exactly
-    one tested rotation builder."""
-    n = np.asarray(normal, dtype=np.float64).copy()
-    nrm = np.linalg.norm(n)
-    if nrm < 1e-12:
-        return np.eye(3)
-    n /= nrm
-    if n[2] < 0:
-        n = -n
-    z_axis = np.array([0.0, 0.0, 1.0])
-    axis   = np.cross(n, z_axis)
-    angle  = np.arccos(np.clip(np.dot(n, z_axis), -1.0, 1.0))
-    if np.linalg.norm(axis) < 1e-6:
-        return np.eye(3)
-    axis /= np.linalg.norm(axis)
-    K = np.array([
-        [ 0,       -axis[2],  axis[1]],
-        [ axis[2],  0,       -axis[0]],
-        [-axis[1],  axis[0],  0      ],
-    ])
-    return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+    # ---- Diagnostic score only (NOT used for any decision) ----
+    SCORE_INLIER_DIST = 0.30     # m; a target point within this of the reference
+                                 # counts as covered
 
 
-def _level_from_normal(pcd, normal, floor_percentile=2.0):
-    """Build a 4x4 T_level that rotates `normal` upright to +Z and puts the
-    ground at Z=0 (low-percentile height in the rotated frame). The height comes
-    from the lowest-Z points, which is the deterministic floor-height estimate."""
-    R = _R_align_normal_to_z(normal)
-    T_level = np.eye(4)
-    T_level[:3, :3] = R
-    pts_rot_z = (np.asarray(pcd.points) @ R.T)[:, 2]
-    ground_z = np.percentile(pts_rot_z, floor_percentile)
-    T_level[2, 3] = -ground_z
-    return T_level
-
-
-def level_from_gravity(pcd, gravity, params=None):
-    """Level using a gravity vector instead of a plane fit."""
-    pct = getattr(params, "FLOOR_Z_PERCENTILE", 2.0) if params else 2.0
-    return _level_from_normal(
-        pcd, -np.asarray(gravity, dtype=np.float64), floor_percentile=pct)
-
-
-def level_gravity_height(pcd, gravity=None, params=None):
-    """PRIMARY levelling for gravity-aligned (FAST-LIO) clouds."""
-    pct = getattr(params, "FLOOR_Z_PERCENTILE", 2.0) if params else 2.0
-    if gravity is not None:
-        up = -np.asarray(gravity, dtype=np.float64)
-    else:
-        up = np.array([0.0, 0.0, 1.0])     # trust gravity-alignment: no rotation
-    return _level_from_normal(pcd, up, floor_percentile=pct)
-
-
-# =============================================================================
-# Ground extraction / levelling 
-# =============================================================================
-def _find_horizontal_plane(pcd, dist_threshold, plane_iters, params, label=""):
-    
-    max_tilt = getattr(params, "GROUND_MAX_TILT_DEG", 30.0)
-    work = pcd
-    remaining_idx = np.arange(len(pcd.points))
-    # track only the best HORIZONTAL candidate (by inlier count) as a tie-break;
-    # tilted planes are never eligible to be returned.
-    best_horiz = None
-    for attempt in range(getattr(params, "GROUND_PLANE_ATTEMPTS", 12)):
-        if len(work.points) < 3:
-            break
-        pm, inl = work.segment_plane(
-            distance_threshold=dist_threshold, ransac_n=3,
-            num_iterations=plane_iters)
-        n = np.array(pm[:3], dtype=np.float64)
-        n /= np.linalg.norm(n)
-        if n[2] < 0:
-            n = -n
-        tilt = np.degrees(np.arccos(np.clip(n[2], -1.0, 1.0)))
-        global_inl = remaining_idx[inl]        # map back to original indices
-        if tilt <= max_tilt:
-            # horizontal: this is the floor. Keep the largest such plane.
-            if best_horiz is None or len(global_inl) > len(best_horiz[1]):
-                best_horiz = (n, global_inl)
-            return best_horiz                  # first horizontal hit is enough
-       
-        mask = np.ones(len(work.points), dtype=bool)
-        mask[inl] = False
-        remaining_idx = remaining_idx[mask]
-        work = work.select_by_index(np.where(mask)[0])
-    # No horizontal plane found within the attempt budget.
-    if best_horiz is not None:
-        return best_horiz
-    return np.array([0.0, 0.0, 1.0]), np.arange(len(pcd.points))
-
-
-def extract_ground_and_level(pcd, dist_threshold, plane_iters, label="",
-                            params=None, gravity=None):
-    """Return 4x4 T_level that rotates cloud upright and puts the ground at Z=0.
-    Behaviour is controlled by params.LEVEL_MODE:
-
-    - "gravity_height": trust the fast lio gravity-alignment. """
-    if params is None:
-        params = AlignParams()
-
-    mode = getattr(params, "LEVEL_MODE", "gravity_height")
-
-    if mode == "gravity_height":
-        return level_gravity_height(pcd, gravity=gravity, params=params)
-
-    # ---- opt-in: RANSAC plane fit ----
-    normal, inliers = _find_horizontal_plane(
-        pcd, dist_threshold, plane_iters, params, label)
-    pct = getattr(params, "FLOOR_Z_PERCENTILE", 2.0)
-    return _level_from_normal(pcd, normal, floor_percentile=pct)
-
-
-def apply_transform(pcd, T):
-    out = copy.deepcopy(pcd)
-    out.transform(T)
-    return out
-
-
-# =============================================================================
-# Ground removal / XY normalize / FPFH 
-# =============================================================================
-def remove_ground_points(pcd, z_threshold):
-    pts  = np.asarray(pcd.points)
-    mask = pts[:, 2] > z_threshold
-    above = o3d.geometry.PointCloud()
-    above.points = o3d.utility.Vector3dVector(pts[mask])
-    if pcd.has_normals():
-        above.normals = o3d.utility.Vector3dVector(np.asarray(pcd.normals)[mask])
-    if pcd.has_colors():
-        above.colors = o3d.utility.Vector3dVector(np.asarray(pcd.colors)[mask])
-    return above
-
-
-def normalize_xy(pcd, center=None):
-    """Recenter a cloud in XY by subtracting `center` (a length-2 or length-3
-    array). If `center` is None, uses this cloud's own bbox center (only correct when a single cloud is centered in isolation).
-
-    Returns (recentered_pcd, center_used).."""
-    if center is None:
-        center = pcd.get_axis_aligned_bounding_box().get_center()
-    center = np.asarray(center, dtype=np.float64)
-    T = np.eye(4)
-    T[0, 3] = -center[0]
-    T[1, 3] = -center[1]
-    return apply_transform(pcd, T), center
-
-
-def _resolve_feature_radius(params):
-    fr = getattr(params, "FEATURE_RADIUS_R", None)
-    if fr is None:
-        fr = params.RANSAC_VOXEL * 5
-    return fr
-
-
-def preprocess_for_ransac(pcd, voxel, normal_r, feature_r):
-    down = pcd.voxel_down_sample(voxel)
-    down.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(radius=normal_r, max_nn=30)
-    )
-    fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-        down,
-        o3d.geometry.KDTreeSearchParamHybrid(radius=feature_r, max_nn=100),
-    )
-    return down, fpfh
-
-
-def make_T(tx=0, ty=0, tz=0):
+def make_T(tx=0.0, ty=0.0, tz=0.0):
     T = np.eye(4)
     T[0, 3], T[1, 3], T[2, 3] = tx, ty, tz
     return T
 
 
-def constrain_to_yaw(T):
-    """Project a transform (in the LEVELLED frame, where both clouds have their
-    floor flat) onto pure yaw + translation. Levelling already fixes pitch/roll,
-    so any pitch/roll in a global-registration result is spurious and a source
-    of wrong, non-deterministic solutions on sparse data. This zeroes it out."""
-    R = T[:3, :3].copy()
-    # yaw = rotation about Z. Extract it from the forward (x) axis projected to XY.
-    yaw = np.arctan2(R[1, 0], R[0, 0])
-    c, s = np.cos(yaw), np.sin(yaw)
-    Rz = np.array([[c, -s, 0.0],
-                   [s,  c, 0.0],
-                   [0.0, 0.0, 1.0]])
+def _tilt_and_z(T):
+    """(tilt_deg, tz): how far the transform's local +Z axis leans from world +Z,
+    and its Z translation. Used to report what the planar constraint removes."""
+    zaxis = np.asarray(T[:3, 2], dtype=float)
+    nz = zaxis[2] / (np.linalg.norm(zaxis) + 1e-12)
+    return float(np.degrees(np.arccos(np.clip(nz, -1.0, 1.0)))), float(T[2, 3])
+
+
+def constrain_planar(T):
+    """Project a 4x4 transform onto PLANAR motion: yaw about +Z and XY
+    translation only. (any z tilt introduced by TEASER or gicp is error 
+    and must be cancelled out)."""
+    yaw = float(np.arctan2(T[1, 0], T[0, 0]))
+    cyaw, syaw = np.cos(yaw), np.sin(yaw)
     out = np.eye(4)
-    out[:3, :3] = Rz
-    out[:3, 3] = T[:3, 3]     # keep translation (incl. any Z offset)
+    out[0, 0], out[0, 1] = cyaw, -syaw
+    out[1, 0], out[1, 1] = syaw, cyaw
+    out[0, 3] = T[0, 3]     # keep X translation
+    out[1, 3] = T[1, 3]     # keep Y translation
+    out[2, 3] = 0.0         # drop Z translation (floors already coincide at Z=0)
     return out
 
 
+# LEVELLING
+def _floor_seed(z, params):
+    """Floor height = the lowest significant horizontal slab. Scanning from the
+    bottom and taking the first slab that reaches FLOOR_MIN_SLAB_FRAC."""
+    z = np.asarray(z)
+    if len(z) == 0:
+        return 0.0
+    lo = float(np.percentile(z, 0.1))
+    hi = float(np.percentile(z, params.FLOOR_SEARCH_PCT))
+    slab = float(params.FLOOR_SLAB_M)
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+        return float(np.median(z))
+    edges = np.arange(lo, hi, slab * 0.5)
+    if len(edges) == 0:
+        return float(np.median(z))
+    counts = np.array([np.count_nonzero((z >= e) & (z < e + slab))
+                       for e in edges])
+    cmax = int(counts.max())
+    if cmax <= 0:
+        return float(np.median(z))
+    thresh = float(params.FLOOR_MIN_SLAB_FRAC) * cmax
+    idx = int(np.argmax(counts >= thresh))   # lowest slab meeting the threshold
+    return float(edges[idx] + slab * 0.5)
+
+
+def fit_floor_plane(pts, normals, params):
+    """Deterministic floor plane z = a*x + b*y + c.
+    Returns (a, b, c, floor_pts, n_floor, horizontal_used)."""
+    pts = np.asarray(pts)
+    z = pts[:, 2]
+    if len(z) < 10:
+        h = float(z.min()) if len(z) else 0.0
+        return 0.0, 0.0, h, pts, len(pts), False
+
+    # 1. keep only floor-like (near-vertical normal) points -> drop walls
+    horizontal_used = False
+    cand = pts
+    if normals is not None and len(normals) == len(pts):
+        nz = np.abs(np.asarray(normals)[:, 2])
+        horiz = nz > np.cos(np.radians(params.FLOOR_MAX_NORMAL_TILT_DEG))
+        if int(horiz.sum()) >= int(params.MIN_FLOOR_POINTS):
+            cand = pts[horiz]
+            horizontal_used = True
+
+    # 2. seed the floor height as the lowest significant horizontal band
+    seed = _floor_seed(cand[:, 2], params)
+    band = float(params.FLOOR_BAND_M)
+    P = cand[np.abs(cand[:, 2] - seed) <= band]
+    if len(P) < 10:
+        return 0.0, 0.0, seed, P, len(P), horizontal_used
+
+    # 3. least-squares plane fit over the floor points, sigma-clipped
+    A = np.c_[P[:, 0], P[:, 1], np.ones(len(P))]
+    b = P[:, 2].astype(np.float64).copy()
+    coef = np.array([0.0, 0.0, float(seed)])
+    for _ in range(max(1, int(params.FLOOR_FIT_ITERS))):
+        sol, _r, _rank, _sv = np.linalg.lstsq(A, b, rcond=None)
+        coef = sol
+        resid = b - A @ coef
+        s = float(np.std(resid))
+        if s < 1e-9:
+            break
+        keep = np.abs(resid) < params.FLOOR_FIT_SIGMA * s
+        if keep.all() or int(keep.sum()) < 10:
+            break
+        A, b = A[keep], b[keep]
+
+    a, bb, c = float(coef[0]), float(coef[1]), float(coef[2])
+    floor_pts = np.c_[A[:, 0], A[:, 1], b]   # final inlier floor points
+    return a, bb, c, floor_pts, len(floor_pts), horizontal_used
+
+
+def level_cloud(pcd, params):
+    pts = np.asarray(pcd.points)
+    normals = np.asarray(pcd.normals) if pcd.has_normals() else None
+    a, bb, c, floor_pts, n_floor, horiz_used = fit_floor_plane(pts, normals, params)
+
+    # floor height = fitted plane sampled at the floor centroid (one
+    # representative height). No rotation, so no need to transform points first.
+    if len(floor_pts) > 0:
+        cx = float(np.mean(floor_pts[:, 0]))
+        cy = float(np.mean(floor_pts[:, 1]))
+        ground_z = float(a * cx + bb * cy + c)
+    else:
+        ground_z = float(c)
+
+    # diagnostic only: the residual tilt we deliberately do NOT correct
+    normal = np.array([a, bb, -1.0])
+    normal /= np.linalg.norm(normal)
+    if normal[2] < 0:
+        normal = -normal               # point up
+    tilt_deg = float(np.degrees(np.arccos(np.clip(normal[2], -1.0, 1.0))))
+
+    T = np.eye(4)
+    T[2, 3] = -ground_z                # Z translation ONLY
+
+    out = copy.deepcopy(pcd)
+    out.transform(T)
+    meta = {"tilt_deg": tilt_deg, "n_floor": int(n_floor),
+            "horizontal_used": bool(horiz_used), "ground_z": ground_z,
+            "normal": [float(normal[0]), float(normal[1]), float(normal[2])]}
+    return out, T, meta
+
+
 # =============================================================================
-# FAISS GPU correspondences 
+# Features / correspondences / solvers 
 # =============================================================================
-def _faiss_supports_gpu():
-    """True if this faiss build has GPU support AND a GPU is visible."""
+def _remove_ground(pcd, z_thresh):
+    pts = np.asarray(pcd.points)
+    keep = pts[:, 2] > z_thresh
+    out = o3d.geometry.PointCloud()
+    out.points = o3d.utility.Vector3dVector(pts[keep])
+    return out
+
+
+def normalize_xy(pcd):
+    """Subtract the XY bounding-box centre so TEASER sees both clouds centred at
+    the origin (as in the notebook). Returns (shifted_pcd, (cx, cy))."""
+    ctr = pcd.get_axis_aligned_bounding_box().get_center()
+    T = make_T(-ctr[0], -ctr[1], 0.0)
+    out = copy.deepcopy(pcd)
+    out.transform(T)
+    return out, (float(ctr[0]), float(ctr[1]))
+
+
+def _fpfh(pcd, voxel, normal_r, feat_r):
+    down = pcd.voxel_down_sample(voxel)
+    down.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=normal_r, max_nn=30))
+    f = o3d.pipelines.registration.compute_fpfh_feature(
+        down, o3d.geometry.KDTreeSearchParamHybrid(radius=feat_r, max_nn=100))
+    return down, f
+
+
+def _correspondences(src_pcd, src_f, ref_pcd, ref_f, faiss_res=None):
+    """Mutual nearest-neighbour FPFH matching -> (3,N) src, (3,N) ref."""
+    A = np.ascontiguousarray(np.array(src_f.data).T, dtype=np.float32)
+    B = np.ascontiguousarray(np.array(ref_f.data).T, dtype=np.float32)
+    sp = np.asarray(src_pcd.points)
+    rp = np.asarray(ref_pcd.points)
+
+    d = A.shape[1]
     try:
-        return (hasattr(faiss, "StandardGpuResources")
-                and faiss.get_num_gpus() > 0)
+        use_gpu = (hasattr(faiss, "StandardGpuResources")
+                   and faiss.get_num_gpus() > 0)
     except Exception:
-        return False
-
-
-def get_correspondences_faiss(src_fpfh, tgt_fpfh, src_pcd, tgt_pcd,
-                              faiss_res=None, mutual=True):
-    """Mutual NN FPFH matching. Returns (src_corr, tgt_corr) as (3,N)."""
-    src_feat = np.ascontiguousarray(np.array(src_fpfh.data).T, dtype=np.float32)
-    tgt_feat = np.ascontiguousarray(np.array(tgt_fpfh.data).T, dtype=np.float32)
-    src_pts  = np.asarray(src_pcd.points)
-    tgt_pts  = np.asarray(tgt_pcd.points)
-
-    d = src_feat.shape[1]
-    if _faiss_supports_gpu():
+        use_gpu = False
+    if use_gpu:
         if faiss_res is None:
             faiss_res = faiss.StandardGpuResources()
         index = faiss.index_cpu_to_gpu(faiss_res, 0, faiss.IndexFlatL2(d))
     else:
-        index = faiss.IndexFlatL2(d)   # CPU fallback
+        index = faiss.IndexFlatL2(d)
 
-    index.add(tgt_feat)
-    _, fwd = index.search(src_feat, 1)
+    index.add(B)
+    _, fwd = index.search(A, 1)
     fwd = fwd.flatten()
-
-    if mutual:
-        index.reset()
-        index.add(src_feat)
-        _, bwd = index.search(tgt_feat[fwd], 1)
-        bwd = bwd.flatten()
-        mask = (bwd == np.arange(len(fwd)))
-        return src_pts[mask].T, tgt_pts[fwd[mask]].T
-
-    return src_pts.T, tgt_pts[fwd].T
+    index.reset()
+    index.add(A)
+    _, bwd = index.search(B[fwd], 1)
+    bwd = bwd.flatten()
+    mutual = (bwd == np.arange(len(fwd)))
+    return sp[mutual].T, rp[fwd[mutual]].T
 
 
-# =============================================================================
-# TEASER++
-# =============================================================================
-class TEASERResult(object):
-    def __init__(self, R, t, src_corr, tgt_corr, noise_bound):
-        self.transformation = np.eye(4)
-        self.transformation[:3, :3] = R
-        self.transformation[:3, 3]  = t
-        src_t   = (R @ src_corr).T + t
-        dists   = np.linalg.norm(src_t - tgt_corr.T, axis=1)
-        inliers = dists < noise_bound
-        self.fitness     = float(inliers.mean()) if len(dists) else 0.0
-        self.inlier_rmse = (float(np.sqrt((dists[inliers] ** 2).mean()))
-                            if inliers.any() else 0.0)
-
-
-def run_teaser(src_corr, tgt_corr, noise_bound, gnc_factor, max_iter):
+def _teaser(src_corr, ref_corr, noise_bound, params):
     p = teaserpp_python.RobustRegistrationSolver.Params()
-    p.cbar2                         = 1.0
-    p.noise_bound                   = noise_bound
-    p.estimate_scaling              = False
+    p.cbar2 = 1.0
+    p.noise_bound = noise_bound
+    p.estimate_scaling = False
     p.rotation_estimation_algorithm = (
         teaserpp_python.RobustRegistrationSolver
         .ROTATION_ESTIMATION_ALGORITHM.GNC_TLS)
-    p.rotation_gnc_factor           = gnc_factor
-    p.rotation_max_iterations       = max_iter
-    p.rotation_cost_threshold       = 1e-12
-    solver = teaserpp_python.RobustRegistrationSolver(p)
-    solver.solve(src_corr, tgt_corr)
-    sol = solver.getSolution()
-    return sol.rotation, sol.translation
+    p.rotation_gnc_factor = params.TEASER_GNC_FACTOR
+    p.rotation_max_iterations = params.TEASER_MAX_ITER
+    p.rotation_cost_threshold = 1e-12
+    s = teaserpp_python.RobustRegistrationSolver(p)
+    s.solve(src_corr, ref_corr)
+    sol = s.getSolution()
+    T = np.eye(4)
+    T[:3, :3] = sol.rotation
+    T[:3, 3] = sol.translation
+    return T
 
 
-# =============================================================================
-# small_gicp ICP
-# =============================================================================
-class _ICPResult(object):
-    def __init__(self, T, fitness, rmse):
-        self.transformation = T
-        self.fitness        = fitness
-        self.inlier_rmse    = rmse
+def _gicp(src_pts, ref_pts, init_T, dist, params):
+    """GICP refine on the levelled clouds
 
-
-def icp_pass(src, tgt, initial_transform, dist_threshold, max_iter):
-    src_pts = np.ascontiguousarray(np.asarray(src.points), dtype=np.float64)
-    tgt_pts = np.ascontiguousarray(np.asarray(tgt.points), dtype=np.float64)
-
-    # small_gicp.align (raw-points overload) does its OWN preprocessing:
-    # downsampling + normal/covariance estimation. Its default
-    # downsampling_resolution=0.25 re-thins already-sparse clouds, which starves
-    # GICP of the covariances it needs (=> nan error, no refinement). Our clouds
-    # are already ICP_VOXEL-downsampled upstream, so set a small resolution to
-    # avoid destructive re-downsampling while still letting it build covariances.
-    ds = getattr(AlignParams, "GICP_DOWNSAMPLE_RES", 0.0)
-    res = small_gicp.align(
-        tgt_pts, src_pts,
-        init_T_target_source=np.linalg.inv(initial_transform),
+    align(target=ref, source=tgt) returns
+    T_target_source; we invert it to get the tgt->ref transform. `init_T` maps
+    tgt->ref, so its inverse is passed as init_T_target_source."""
+    src_sg = small_gicp.PointCloud(
+        np.ascontiguousarray(src_pts, dtype=np.float64))    # target being aligned
+    tgt_sg = small_gicp.PointCloud(
+        np.ascontiguousarray(ref_pts, dtype=np.float64))    # reference
+    r = small_gicp.align(
+        tgt_sg, src_sg,
+        init_T_target_source=np.linalg.inv(init_T),
         registration_type="GICP",
-        downsampling_resolution=ds,
-        max_correspondence_distance=dist_threshold,
+        max_correspondence_distance=dist,
         num_threads=8,
-        max_iterations=max_iter,
-    )
-    T = np.linalg.inv(res.T_target_source)
-    n_in = res.num_inliers
-    fitness = n_in / max(len(src_pts), 1)
-    if n_in > 0 and np.isfinite(res.error):
-        rmse = float(np.sqrt(res.error / n_in))
-    else:
-        rmse = float("inf")
-    return _ICPResult(T, fitness, rmse)
+        max_iterations=params.ICP_MAX_ITER)
+    return np.linalg.inv(r.T_target_source)
 
 
-# =============================================================================
-# ICP-voxel downsample + normals 
-# =============================================================================
-def downsample_for_icp(pcd, params):
-    down = pcd.voxel_down_sample(params.ICP_VOXEL)
-    down.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(
-            radius=params.NORMAL_RADIUS, max_nn=30))
-    return down
-
-# Reference preprocessing
 class PreparedReference(object):
-    """Everything about the reference that the per-target alignment needs,
-    computed once.
-
-    Pass `gravity` (gravity direction in the reference cloud's frame, pointing
-    DOWN -- from FAST-LIO) to level the reference deterministically. The
-    reference and each target have different camera_init origins, so each MUST
-    be levelled with its OWN gravity vector; the reference's is captured here."""
-    def __init__(self, ref_cloud, params, gravity=None):
+    def __init__(self, ref_cloud, params):
         self.params = params
-        self.gravity = None if gravity is None else np.asarray(
-            gravity, dtype=np.float64)
-        # Cell 9: ICP-voxel downsample + normals BEFORE levelling
-        ref_icp = downsample_for_icp(ref_cloud, params)
-        # Cell 10: level the downsampled cloud (gravity if available, else fit)
-        self.T_ref_level = extract_ground_and_level(
-            ref_icp, params.GROUND_DIST_THRESHOLD,
-            params.GROUND_PLANE_ITERS, label="REF", params=params,
-            gravity=self.gravity)
-        self.ref_levelled = apply_transform(ref_icp, self.T_ref_level)
-        self.ref_levelled.estimate_normals(
-            o3d.geometry.KDTreeSearchParamHybrid(
-                radius=params.NORMAL_RADIUS, max_nn=30))
-        # ground-removed / normalized / FPFH for global registration
-        ref_above = remove_ground_points(self.ref_levelled, params.GROUND_REMOVE_Z)
-
-        # XY normalization: record the reference center so the TARGET can be
-        # recentered by the SAME value (see XY_NORMALIZE_MODE). This is the fix
-        # for the bbox-center bug: never let the two clouds use different centers.
-        xy_mode = getattr(params, "XY_NORMALIZE_MODE", "reference")
-        if xy_mode == "none":
-            self.ref_xy_ctr = np.zeros(3)
-            ref_norm = ref_above
-        else:
-            ref_norm, self.ref_xy_ctr = normalize_xy(ref_above, center=None)
-
-        feat_r = _resolve_feature_radius(params)
-        self.ref_down, self.ref_fpfh = preprocess_for_ransac(
-            ref_norm, params.RANSAC_VOXEL,
-            params.NORMAL_RADIUS_R, feat_r)
+        self.ref_cloud = ref_cloud
+        self.ref_raw = np.asarray(ref_cloud.points)
 
 
-# Full target alignment  ->  T mapping target frame into reference frame
-def align_target(tgt_cloud, prepared_ref, params, faiss_res=None, logger=None,
-                 gravity=None):
-    """Returns (T_full 4x4, info dict). T_full maps points in the target's
-    native frame into the reference's native frame.
+# =============================================================================
+# full alignment logic
+# =============================================================================
+def align_target(tgt_cloud, prepared_ref, params, faiss_res=None, logger=None):
+    """Returns (T_full 4x4, info). Deterministic."""
+    def log(m):
+        if logger:
+            logger(m)
 
-    Pass `gravity` (gravity direction in the TARGET cloud's own frame, pointing
-    DOWN -- from FAST-LIO, ideally sampled at the END of the accumulation window
-    when the estimate has converged). This levels the target deterministically,
-    removing the RANSAC plane fit and its run-to-run variation. If omitted, the
-    plane-fit fallback is used."""
-    def log(msg):
-        if logger is not None:
-            logger(msg)
+    p = params
 
-    info = {}
-    grav = None if gravity is None else np.asarray(gravity, dtype=np.float64)
-    info["used_gravity_levelling"] = bool(
-        grav is not None and getattr(params, "USE_GRAVITY_LEVELLING", True))
+    # ---- downsample to ICP voxel + normals ----
+    ref_icp = prepared_ref.ref_cloud.voxel_down_sample(p.ICP_VOXEL)
+    ref_icp.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=p.NORMAL_RADIUS, max_nn=30))
+    tgt_icp = tgt_cloud.voxel_down_sample(p.ICP_VOXEL)
+    tgt_icp.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=p.NORMAL_RADIUS, max_nn=30))
 
-    # ICP-voxel downsample + normals
-    tgt_icp = downsample_for_icp(tgt_cloud, params)
+    # ---- 1. LEVEL each cloud (plane locates floor; pure Z-shift, no rotation) ----
+    ref_lev, T_ref_level, ref_meta = level_cloud(ref_icp, p)
+    tgt_lev, T_tgt_level, tgt_meta = level_cloud(tgt_icp, p)
+    ref_tilt, tgt_tilt = ref_meta["tilt_deg"], tgt_meta["tilt_deg"]
+    rn, tn = ref_meta["normal"], tgt_meta["normal"]
+    log("levelling ref (Z-shift only): n=[%.2f,%.2f,%.2f] tilt=%.1fdeg "
+        "floor_pts=%d horiz=%s ground_z=%.2f"
+        % (rn[0], rn[1], rn[2], ref_tilt, ref_meta["n_floor"],
+           ref_meta["horizontal_used"], ref_meta["ground_z"]))
+    log("levelling tgt (Z-shift only): n=[%.2f,%.2f,%.2f] tilt=%.1fdeg "
+        "floor_pts=%d horiz=%s ground_z=%.2f"
+        % (tn[0], tn[1], tn[2], tgt_tilt, tgt_meta["n_floor"],
+           tgt_meta["horizontal_used"], tgt_meta["ground_z"]))
 
-    # level the target (gravity if available, else plane fit)
-    T_tgt_level = extract_ground_and_level(
-        tgt_icp, params.GROUND_DIST_THRESHOLD,
-        params.GROUND_PLANE_ITERS, label="TGT", params=params, gravity=grav)
-    tgt_levelled = apply_transform(tgt_icp, T_tgt_level)
-    tgt_levelled.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(
-            radius=params.NORMAL_RADIUS, max_nn=30))
+    # ---- 2. remove ground, XY-normalise, FPFH ----
+    ref_above = _remove_ground(ref_lev, p.GROUND_REMOVE_Z)
+    tgt_above = _remove_ground(tgt_lev, p.GROUND_REMOVE_Z)
+    ref_norm, ref_xy = normalize_xy(ref_above)
+    tgt_norm, tgt_xy = normalize_xy(tgt_above)
+    ref_d, ref_f = _fpfh(ref_norm, p.RANSAC_VOXEL, p.NORMAL_RADIUS_R, p.FEATURE_RADIUS_R)
+    tgt_d, tgt_f = _fpfh(tgt_norm, p.RANSAC_VOXEL, p.NORMAL_RADIUS_R, p.FEATURE_RADIUS_R)
+    log("FPFH: ref=%d tgt=%d pts" % (len(ref_d.points), len(tgt_d.points)))
 
-    # ground-remove + normalize + FPFH
-    tgt_above = remove_ground_points(tgt_levelled, params.GROUND_REMOVE_Z)
-
-    # XY normalization: recenter the target by the SAME center used
-    # for the reference (or skip entirely), NOT by the target's own bbox center.
-    # Using each cloud's own bbox center injects a spurious relative offset when
-    # the clouds cover different regions (partial overlap), which fights TEASER.
-    xy_mode = getattr(params, "XY_NORMALIZE_MODE", "reference")
-    if xy_mode == "none":
-        tgt_norm = tgt_above
-        tgt_xy_ctr = np.zeros(3)
-        shared_ctr = np.zeros(3)
-    elif xy_mode == "self":
-        tgt_norm, tgt_xy_ctr = normalize_xy(tgt_above, center=None)
-        shared_ctr = prepared_ref.ref_xy_ctr
-    else:  # "reference" (default): both clouds recentered by the reference center
-        shared_ctr = prepared_ref.ref_xy_ctr
-        tgt_norm, tgt_xy_ctr = normalize_xy(tgt_above, center=shared_ctr)
-
-    feat_r = _resolve_feature_radius(params)
-    tgt_down, tgt_fpfh = preprocess_for_ransac(
-        tgt_norm, params.RANSAC_VOXEL,
-        params.NORMAL_RADIUS_R, feat_r)
-    log("FPFH: ref=%d tgt=%d pts (xy_mode=%s, feat_r=%.2f)" %
-        (len(prepared_ref.ref_down.points), len(tgt_down.points),
-         xy_mode, feat_r))
-
-    # faiss correspondences  (src=target, tgt=reference)
-    src_corr, tgt_corr = get_correspondences_faiss(
-        tgt_fpfh, prepared_ref.ref_fpfh, tgt_down, prepared_ref.ref_down,
-        faiss_res=faiss_res, mutual=True)
-    n_corr = src_corr.shape[1]
-    info["n_correspondences"] = int(n_corr)
-    log("FAISS mutual correspondences: %d" % n_corr)
+    # ---- 3. FAISS mutual-NN -> TEASER (src = target, ref = reference) ----
+    src_c, ref_c = _correspondences(tgt_d, tgt_f, ref_d, ref_f, faiss_res)
+    n_corr = src_c.shape[1]
+    log("mutual correspondences: %d" % n_corr)
     if n_corr < 3:
-        raise RuntimeError(
-            "Only %d correspondences (<3). Lower RANSAC_VOXEL." % n_corr)
+        raise RuntimeError("Only %d correspondences (<3)." % n_corr)
 
-    # TEASER++ global
-    R_te, t_te = run_teaser(
-        src_corr, tgt_corr, params.TEASER_NOISE_BOUND,
-        params.TEASER_GNC_FACTOR, params.TEASER_MAX_ITER)
-    r = TEASERResult(R_te, t_te, src_corr, tgt_corr, params.TEASER_NOISE_BOUND)
-    info["teaser_fitness"] = r.fitness
-    info["teaser_rmse"]    = r.inlier_rmse
-    log("TEASER fitness=%.4f rmse=%.4f" % (r.fitness, r.inlier_rmse))
+    T_teaser = _teaser(src_c, ref_c, p.TEASER_NOISE_BOUND, p)
+    res = np.linalg.norm(
+        (T_teaser[:3, :3] @ src_c + T_teaser[:3, 3:4]) - ref_c, axis=0)
+    n_inliers = int(np.count_nonzero(res < p.TEASER_NOISE_BOUND))
+    teaser_yaw = float(np.degrees(np.arctan2(T_teaser[1, 0], T_teaser[0, 0])))
+    log("TEASER yaw=%.2f deg  inliers=%d/%d" % (teaser_yaw, n_inliers, n_corr))
 
-    # compose global transform in levelled frame.
-    # In "reference"/"self" modes both clouds were shifted by shared_ctr; in
-    # "none" mode shared_ctr is zero so these are identities.
-    T_tgt_to_norm = make_T(-shared_ctr[0], -shared_ctr[1])
-    T_norm_to_ref = make_T(shared_ctr[0], shared_ctr[1])
-    T_global_levelled = T_norm_to_ref @ r.transformation @ T_tgt_to_norm
+    # ---- 4. undo XY-normalisation -> levelled-frame transform ----
+    T_tgt_to_norm = make_T(-tgt_xy[0], -tgt_xy[1])
+    T_norm_to_ref = make_T(ref_xy[0], ref_xy[1])
+    T_lev = T_norm_to_ref @ T_teaser @ T_tgt_to_norm
 
-    # zero out teaser inaccuracies
-    if getattr(params, "CONSTRAIN_TO_YAW", True):
-        T_global_levelled = constrain_to_yaw(T_global_levelled)
+    # PLANAR CONSTRAINT
+    # Strip the z transformation that TEASER finds
+    tt, tz = _tilt_and_z(T_lev)
+    T_lev = constrain_planar(T_lev)
+    log("TEASER planar-constrain: removed tilt=%.2fdeg z=%.3fm" % (tt, tz))
 
-    # GICP refinement in levelled frame
-    r1 = icp_pass(tgt_levelled, prepared_ref.ref_levelled, T_global_levelled,
-                  params.ICP_DIST_COARSE, params.ICP_MAX_ITER)
-    r2 = icp_pass(tgt_levelled, prepared_ref.ref_levelled, r1.transformation,
-                  params.ICP_DIST_FINE, params.ICP_MAX_ITER)
-    info["icp_fitness"] = r2.fitness
-    info["icp_rmse"]    = r2.inlier_rmse
-    log("GICP fitness=%.4f rmse=%.4fcm" % (r2.fitness, r2.inlier_rmse * 100))
+    # ---- 5. GICP refine (coarse then fine) on the full levelled clouds ----
+    # GICP is unconstrained internally, so re-project to planar after EACH pass
+    src_pts = np.ascontiguousarray(np.asarray(tgt_lev.points), dtype=np.float64)
+    ref_pts = np.ascontiguousarray(np.asarray(ref_lev.points), dtype=np.float64)
+    for dist in (p.ICP_DIST_COARSE, p.ICP_DIST_FINE):
+        T_lev = _gicp(src_pts, ref_pts, T_lev, dist, p)
+        gt, gz = _tilt_and_z(T_lev)
+        T_lev = constrain_planar(T_lev)
+        log("GICP(%.2f) planar-constrain: removed tilt=%.2fdeg z=%.3fm"
+            % (dist, gt, gz))
 
-    # compose back out of levelled frames into native frames:
-    #    target_native --T_tgt_level--> target_levelled --r2--> ref_levelled
-    #    --inv(T_ref_level)--> ref_native
-    #    r2 is in the levelled frame, so constrain it to yaw too -- GICP can
-    #    re-introduce small spurious pitch/roll during refinement.
-    r2_levelled = r2.transformation
-    if getattr(params, "CONSTRAIN_TO_YAW", True):
-        r2_levelled = constrain_to_yaw(r2_levelled)
-    T_full = np.linalg.inv(prepared_ref.T_ref_level) @ r2_levelled @ T_tgt_level
+    # ---- diagnostic score (reported only; drives no decision) --> EDIT TO MAKE IT INFORMATIVE SOON ----
+    kd = o3d.geometry.KDTreeFlann(ref_lev)
+    rs = np.random.RandomState(0)
+    samp = src_pts if len(src_pts) <= 3000 else \
+        src_pts[rs.choice(len(src_pts), 3000, replace=False)]
+    q = (T_lev[:3, :3] @ samp.T).T + T_lev[:3, 3]
+    d = np.array([np.sqrt(kd.search_knn_vector_3d(x, 1)[2][0]) for x in q])
+    inl = d < p.SCORE_INLIER_DIST
+    coverage = float(inl.mean())
+    rmse = float(np.sqrt((d[inl] ** 2).mean())) if inl.any() else float("inf")
+    yaw = float(np.degrees(np.arctan2(T_lev[1, 0], T_lev[0, 0])))
+    log("final yaw=%.2f deg  coverage=%.2f  rmse=%.2fm  median=%.2fm"
+        % (yaw, coverage, rmse, float(np.median(d))))
+
+
+    T_full = np.linalg.inv(T_ref_level) @ T_lev @ T_tgt_level
+    full_tilt, full_z = _tilt_and_z(T_full)
+    log("T_full: yaw=%.2fdeg tilt=%.3fdeg z=%.3fm (z == ref_gz-tgt_gz floor offset)"
+        % (yaw, full_tilt, full_z))
+
+    info = {
+        "ref_tilt_deg": ref_tilt,
+        "tgt_tilt_deg": tgt_tilt,
+        "ref_floor_pts": int(ref_meta["n_floor"]),
+        "tgt_floor_pts": int(tgt_meta["n_floor"]),
+        "ref_ground_z": float(ref_meta["ground_z"]),
+        "tgt_ground_z": float(tgt_meta["ground_z"]),
+        "n_correspondences": int(n_corr),
+        "teaser_inliers": int(n_inliers),
+        "teaser_yaw_deg": teaser_yaw,
+        "yaw_deg": yaw,
+        "full_tilt_deg": full_tilt,
+        "full_z_offset": full_z,
+        "coverage": coverage,
+        "inlier_rmse": rmse,
+        "median_dist": float(np.median(d)),
+    }
     return T_full, info

@@ -18,7 +18,7 @@ def main():
     ap.add_argument("--bag", required=True)
     ap.add_argument("--topic", default="/cloud_registered")
     ap.add_argument("--every_nth", type=int, default=10)
-    ap.add_argument("--out", default=os.path.expanduser("../maps/test_tgt1.pcd"))
+    ap.add_argument("--out", default=os.path.expanduser("/home/alvink/catkin_ws/maps/reference_office.pcd"))
     ap.add_argument("--voxel", type=float, default=0.0,
                     help="optional voxel downsample of saved reference (0=off)")
     args = ap.parse_args()
