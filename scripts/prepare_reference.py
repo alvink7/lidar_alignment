@@ -2,15 +2,28 @@
 # -*- coding: utf-8 -*-
 """
 the reference should generally be the larger bag so we don't spend more online time doing computations
+
+--sc_out_dir (optional): ALSO build a Scan Context keyframe DB from the
+same bag, via scancontext/python/sc_reference.build_reference_db(). This
+is a SEPARATE index from the fused .pcd below -- Scan Context compares an
+egocentric query against a database of egocentric observations, and a
+fused multi-frame cloud has no single vantage point to compare against
+(see scancontext/python/sc_reference.py docstring). The fused .pcd this
+script has always produced is unaffected and still useful for dense GICP
+geometry; it's just not what Scan Context indexes.
 """
 
 import argparse
 import os
+import sys
 import numpy as np
 import open3d as o3d
 
 import rosbag
 from sensor_msgs import point_cloud2
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                 "..", "scancontext", "python"))
 
 
 def main():
@@ -21,7 +34,33 @@ def main():
     ap.add_argument("--out", default=os.path.expanduser("/home/alvink/catkin_ws/maps/reference_office.pcd"))
     ap.add_argument("--voxel", type=float, default=0.0,
                     help="optional voxel downsample of saved reference (0=off)")
+
+    # -------- optional Scan Context keyframe DB (see module docstring) --------
+    ap.add_argument("--sc_out_dir", default=None,
+                     help="if set, ALSO build a Scan Context keyframe DB "
+                          "here from this bag's /cloud_registered_body + "
+                          "/Odometry")
+    ap.add_argument("--sc_cloud_topic", default="/cloud_registered_body")
+    ap.add_argument("--sc_odom_topic", default="/Odometry")
+    ap.add_argument("--sc_lidar_height", type=float, default=None,
+                     help="required if --sc_out_dir is set: the sensor's "
+                          "approximate height above ground for THIS "
+                          "platform/mounting (metres) -- see "
+                          "sc_keyframes.build_sc_cloud docstring")
+    ap.add_argument("--sc_spacing_m", type=float, default=0.5)
+    ap.add_argument("--sc_spacing_deg", type=float, default=10.0)
+    ap.add_argument("--sc_accumulate_sec", type=float, default=0.3)
+    ap.add_argument("--sc_voxel", type=float, default=0.5)
+    ap.add_argument("--sc_ceiling_crop_m", type=float, default=None,
+                     help="metres above the SENSOR; set indoors/under cover")
+    ap.add_argument("--sc_pc_max_radius", type=float, default=20.0,
+                     help="size to the actual environment scale")
+    ap.add_argument("--sc_dist_thres", type=float, default=0.13)
     args = ap.parse_args()
+
+    if args.sc_out_dir and args.sc_lidar_height is None:
+        raise SystemExit("--sc_lidar_height is required when --sc_out_dir is set "
+                          "(no default -- it's a real, platform-specific value)")
 
     bag_path = os.path.expanduser(args.bag)
     out_path = os.path.expanduser(args.out)
@@ -70,6 +109,18 @@ def main():
 
     o3d.io.write_point_cloud(out_path, cloud)
     print("Saved reference: %s" % out_path)
+
+    if args.sc_out_dir:
+        import sc_reference
+        print("\nBuilding Scan Context keyframe DB -> %s ..." % args.sc_out_dir)
+        n_kf = sc_reference.build_reference_db(
+            bag_path, os.path.expanduser(args.sc_out_dir), args.sc_lidar_height,
+            cloud_topic=args.sc_cloud_topic, odom_topic=args.sc_odom_topic,
+            spacing_m=args.sc_spacing_m, spacing_deg=args.sc_spacing_deg,
+            accumulate_sec=args.sc_accumulate_sec, voxel=args.sc_voxel,
+            ceiling_crop_m=args.sc_ceiling_crop_m,
+            pc_max_radius=args.sc_pc_max_radius, sc_dist_thres=args.sc_dist_thres)
+        print("Saved %d Scan Context keyframes -> %s" % (n_kf, args.sc_out_dir))
 
 
 if __name__ == "__main__":
