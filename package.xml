@@ -17,5 +17,10 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
   <exec_depend>tf</exec_depend>
+
+  <!-- scancontext_py C++ extension (place recognition front-end) -->
+  <build_depend>libpcl-dev</build_depend>
+  <build_depend>libeigen3-dev</build_depend>
 </package>

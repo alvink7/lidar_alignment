@@ -1,10 +1,22 @@
 # cloud_aligner parameters
-# Edit here instead of in Python. Loaded by align.launch into the node's
-# private namespace (~param). Anything not listed falls back to the in-code
-# defaults in alignment_core.AlignParams.
+#
+# THIS FILE IS THE SINGLE SOURCE OF TRUTH. Edit here, not in Python and not in
+# align.launch. Loaded by align.launch into the node's private namespace
+# (~param). Anything not listed falls back to the in-code defaults in
+# alignment_core.AlignParams.
+#
+# align.launch's args are OPTIONAL command-line overrides only: each is applied
+# after this file and ONLY if you actually pass it, e.g.
+#     roslaunch align.launch num_frames:=120 GLOBAL_VOXEL:=0.75
+# Leave an arg unset and the value below is what the node uses.
+
+# ---- reference map ----
+# The prior map the target is relocalized INTO (the fixed frame). The node
+# refuses to start if this is unset -- there is deliberately no silent default,
+# because quietly aligning against the wrong map is worse than not starting.
+reference_pcd: "~/catkin_ws/data/maps/droneparkscan.pcd"
 
 # ---- topics & I/O ----
-reference_pcd: "~/catkin_ws/maps/reference_jul1.pcd"
 input_topic: "/cloud_registered"
 output_topic: "/target_to_reference"
 matrix_topic: "/target_to_reference_matrix"
@@ -18,18 +30,61 @@ reference_frame: "reference_map"
 # Raise if the first frames are too sparse for a reliable alignment.
 num_frames: 50
 
+# ---- publish gate ----
+# Refuse to publish a transform that fails these. COVERAGE is the discriminator
+# between a good and a failed registration; RMSE is NOT, because it is measured
+# over inliers only, so a badly-aligned result with very few inliers can still
+# report a small RMSE (the observed failure had cov=0.29 with rmse=0.12m, i.e.
+# an rmse indistinguishable from the good runs at 0.09-0.10m).
+# Observed: good alignments cov 0.79-0.90, the failure cov 0.29.
+min_coverage: 0.50        # 0.0 disables the gate
+max_rmse_m: 0.50          # deliberately loose; coverage does the real work
+
 # ---- pipeline tuning (override AlignParams) ----
-# Global registration
-RANSAC_VOXEL: 0.30        # smaller -> more FPFH features/correspondences, slower
-TEASER_NOISE_BOUND: 0.60  # max correspondence error (m); ~ RANSAC_VOXEL * 2
+# Global map-to-map registration (align_target runs this full 6-DOF path;
+# see global_register.py). One knob, GLOBAL_VOXEL, sets the sampling scale.
+#
+# *** GLOBAL_VOXEL MUST MATCH THE SCENE SCALE (roughly: XY extent / 200) ***
+#   ~17m indoor scene  (reference_jul1)      -> 0.10
+#   ~200m outdoor map  (droneparkscan)       -> 0.75
+# Too coarse washes the geometry out; too fine explodes memory. A mismatched
+# voxel is the #1 cause of a garbage transform with near-zero coverage.
+#
+# Measured on Jul2_target.bag -> reference_jul1.pcd (120 accumulated frames):
+#     voxel 0.08 -> yaw -85.5  tilt  1.5  inl 58  cov 0.79   OK
+#     voxel 0.10 -> yaw -66.2  tilt 79.6  inl  9  cov 0.29   FAILS (unlucky scale)
+#     voxel 0.12 -> yaw -86.5  tilt  2.3  inl 34  cov 0.85   OK  <-- chosen
+#     voxel 0.15 -> yaw -86.2  tilt  2.5  inl 35  cov 0.90   OK
+#     voxel 0.20 -> yaw +34.2  tilt  0.7  inl 23  cov 0.49   FAILS
+# The stable band is ~0.08-0.15; 0.12 sits mid-band (not next to a failing
+# scale) and lands within 0.06m of ground-truth translation. This pair is
+# MARGINAL -- a single scale can fail unluckily, which is why the coverage
+# gate below matters.
+GLOBAL_VOXEL: 0.75        # set for the INDOOR reference_jul1 scene
 
-# Ground handling
-GROUND_REMOVE_Z: 0.30     # points below this (after levelling) treated as ground
+# Leave the three below UNSET. The node derives them from GLOBAL_VOXEL
+# (x3, x5, x2) whenever GLOBAL_VOXEL is overridden. Previously GLOBAL_VOXEL
+# was set here to 0.75 while these stayed at the 0.10-derived in-code values,
+# giving an INCOHERENT set (voxel 0.75 with a 0.30 normal radius) -- every FPFH
+# descriptor was then built from ~1 neighbour and registration failed outright
+# (arbitrary ~90deg tilt, coverage 0). Override individually ONLY to
+# deliberately break the derived relationship.
+# GLOBAL_NORMAL_R: 0.30
+# GLOBAL_FEATURE_R: 0.50
+# GLOBAL_TEASER_NB: 0.20
 
-# ICP refinement
-ICP_VOXEL: 0.10
-ICP_DIST_COARSE: 0.5
-ICP_DIST_FINE: 0.1
+# ---- Scan Context (DEPRECATED / disabled) ----
+# The scancontext/ package has been removed from this repo, so enabling this
+# will make the node fail on import. Kept false; the global-registration path
+# in align_target replaces it entirely.
+use_scan_context: false
+sc_db_dir: ""
+sc_skip_teaser: false
+# Egocentric (body-frame) cloud + pose topics -- distinct from input_topic
+# above (world-frame). Only read when use_scan_context is true.
+sc_cloud_topic: "/cloud_registered_body"
+sc_odom_topic: "/Odometry"
+sc_max_odom_gap: 0.05     # max time gap (s) to pair a cloud with an odom sample
 
 # ---- static TF broadcast (Option 1) ----
 # Broadcasts reference_frame -> odom_parent_frame so FAST-LIO's odometry

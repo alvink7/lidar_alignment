@@ -1,17 +1,56 @@
 <launch>
-  <arg name="reference_pcd"   default="$(env HOME)/catkin_ws/maps/reference_jul1.pcd"/>
-  <arg name="input_topic"     default="/cloud_registered"/>
-  <arg name="num_frames"      default="10"/>
-  <arg name="reference_frame" default="reference_map"/>
+  <!-- ==================================================================
+       All defaults live in config/params.yaml, which is the single source
+       of truth. The args below are OPTIONAL command-line overrides: pass
+       one and it wins; leave it unset ("") and the yaml value is used.
+
+           roslaunch align.launch                      (pure params.yaml)
+           roslaunch align.launch num_frames:=120      (override just that)
+           roslaunch align.launch GLOBAL_VOXEL:=0.75   (outdoor scale)
+
+       Previously these args had real defaults and were applied AFTER the
+       rosparam load, so they silently overrode params.yaml's num_frames,
+       input_topic and reference_frame, making those yaml entries dead.
+       ================================================================== -->
+  <arg name="reference_pcd"    default=""/>
+  <arg name="input_topic"      default=""/>
+  <arg name="num_frames"       default=""/>
+  <arg name="reference_frame"  default=""/>
+
+  <!-- Global-registration scale. Leave unset to use params.yaml; the node
+       re-derives GLOBAL_NORMAL_R, GLOBAL_FEATURE_R and GLOBAL_TEASER_NB
+       from whatever voxel ends up in effect, so overriding this alone is
+       safe and stays coherent. -->
+  <arg name="GLOBAL_VOXEL"     default=""/>
+
+  <!-- Scan Context is deprecated (scancontext/ removed); see params.yaml. -->
+  <arg name="use_scan_context" default=""/>
+  <arg name="sc_db_dir"        default=""/>
+  <arg name="sc_skip_teaser"   default=""/>
 
   <node pkg="cloud_aligner" type="alignment_node.py" name="cloud_alignment_node"
         output="screen">
-    
+
+    <!-- defaults first ... -->
     <rosparam command="load" file="$(find cloud_aligner)/config/params.yaml"/>
 
-    <param name="reference_pcd"   value="$(arg reference_pcd)"/>
-    <param name="input_topic"     value="$(arg input_topic)"/>
-    <param name="num_frames"      value="$(arg num_frames)"/>
-    <param name="reference_frame" value="$(arg reference_frame)"/>
+    <!-- ... then ONLY the args that were actually passed override them -->
+    <param name="reference_pcd"   value="$(arg reference_pcd)"
+           if="$(eval arg('reference_pcd') != '')"/>
+    <param name="input_topic"     value="$(arg input_topic)"
+           if="$(eval arg('input_topic') != '')"/>
+    <param name="num_frames"      value="$(arg num_frames)"
+           if="$(eval arg('num_frames') != '')"/>
+    <param name="reference_frame" value="$(arg reference_frame)"
+           if="$(eval arg('reference_frame') != '')"/>
+    <param name="GLOBAL_VOXEL"    value="$(arg GLOBAL_VOXEL)"
+           if="$(eval arg('GLOBAL_VOXEL') != '')"/>
+
+    <param name="use_scan_context" value="$(arg use_scan_context)"
+           if="$(eval arg('use_scan_context') != '')"/>
+    <param name="sc_db_dir"        value="$(arg sc_db_dir)"
+           if="$(eval arg('sc_db_dir') != '')"/>
+    <param name="sc_skip_teaser"   value="$(arg sc_skip_teaser)"
+           if="$(eval arg('sc_skip_teaser') != '')"/>
   </node>
 </launch>
