@@ -5,6 +5,7 @@ import bisect
 import os
 import sys
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
@@ -42,7 +43,7 @@ class AlignmentNode(object):
         self.input_topic = rospy.get_param("~input_topic", "/cloud_registered")
         self.output_topic = rospy.get_param("~output_topic", "/target_to_reference")
         self.matrix_topic = rospy.get_param("~matrix_topic", "/target_to_reference_matrix")
-        self.num_frames = int(rospy.get_param("~num_frames", 10))
+        self.num_frames = int(rospy.get_param("~num_frames", 120))
         self.reference_frame = rospy.get_param("~reference_frame", "reference_map")
         # target frame: read from incoming msg header, or override
         self.target_frame_override = rospy.get_param("~target_frame", "")
@@ -125,15 +126,60 @@ class AlignmentNode(object):
                 setattr(self.params, name, int(pv))
                 rospy.loginfo("param override %s=%s", name, pv)
 
-        # Always log the FINAL scale set, and refuse to fail silently on an
-        # incoherent one. A normal/feature radius at or below the voxel pitch
-        # means each descriptor sees ~1 neighbour -> meaningless FPFH -> an
-        # arbitrary transform with ~0 coverage (see the comment above).
-        rospy.loginfo("global-reg scale: voxel=%.3f normal_r=%.3f feat_r=%.3f "
-                      "teaser_nb=%.3f", self.params.GLOBAL_VOXEL,
-                      self.params.GLOBAL_NORMAL_R, self.params.GLOBAL_FEATURE_R,
-                      self.params.GLOBAL_TEASER_NB)
-        if (self.params.GLOBAL_NORMAL_R <= self.params.GLOBAL_VOXEL or
+        # -------- multi-scale sweep (alignment_core._sweep) --------
+        # GLOBAL_SWEEP on: register at a ladder of voxels chosen from the
+        # accumulated target cloud (or GLOBAL_VOXELS) and keep the cross-scale
+        # consensus. GLOBAL_VOXEL and the three radii above are then UNUSED --
+        # each scale derives its own radii x3/x5/x2.
+        pv = rospy.get_param("~GLOBAL_SWEEP", None)
+        if pv is not None:
+            self.params.GLOBAL_SWEEP = bool(pv)
+        pv = rospy.get_param("~GLOBAL_VOXELS", None)
+        if pv is not None:
+            self.params.GLOBAL_VOXELS = [float(x) for x in pv] if pv else None
+        pv = rospy.get_param("~GLOBAL_AUTO_FACTORS", None)
+        if pv:
+            self.params.GLOBAL_AUTO_FACTORS = tuple(float(x) for x in pv)
+        for name in ("CONSENSUS_ROT_DEG", "CONSENSUS_TRANS_FACTOR"):
+            pv = rospy.get_param("~%s" % name, None)
+            if pv is not None:
+                setattr(self.params, name, float(pv))
+        for name in ("GLOBAL_TARGET_POINTS", "GLOBAL_MAX_POINTS",
+                     "CONSENSUS_MIN_AGREE"):
+            pv = rospy.get_param("~%s" % name, None)
+            if pv is not None:
+                setattr(self.params, name, int(pv))
+        if rospy.has_param("~GLOBAL_MAX_TILT_DEG"):
+            pv = rospy.get_param("~GLOBAL_MAX_TILT_DEG")
+            self.params.GLOBAL_MAX_TILT_DEG = None if pv is None else float(pv)
+        # publish gate: refuse to publish when the scales did not agree
+        self.require_consensus = bool(rospy.get_param("~require_consensus", True))
+
+        if self.params.GLOBAL_SWEEP:
+            rospy.loginfo("global-reg: SWEEP mode  voxels=%s  target_points=%d "
+                          "factors=%s  consensus: rot<%.1fdeg trans<%.1fxvoxel "
+                          "min_agree=%d  max_tilt=%s  require_consensus=%s",
+                          self.params.GLOBAL_VOXELS or "auto-from-target",
+                          self.params.GLOBAL_TARGET_POINTS,
+                          list(self.params.GLOBAL_AUTO_FACTORS),
+                          self.params.CONSENSUS_ROT_DEG,
+                          self.params.CONSENSUS_TRANS_FACTOR,
+                          self.params.CONSENSUS_MIN_AGREE,
+                          self.params.GLOBAL_MAX_TILT_DEG,
+                          self.require_consensus)
+        else:
+            # Fixed mode: log the FINAL scale set (see the incoherence check below).
+            rospy.loginfo("global-reg: FIXED mode  voxel=%.3f normal_r=%.3f "
+                          "feat_r=%.3f teaser_nb=%.3f", self.params.GLOBAL_VOXEL,
+                          self.params.GLOBAL_NORMAL_R,
+                          self.params.GLOBAL_FEATURE_R,
+                          self.params.GLOBAL_TEASER_NB)
+        # Fixed mode only: refuse to fail silently on an incoherent scale set. A
+        # normal/feature radius at or below the voxel pitch means each
+        # descriptor sees ~1 neighbour -> meaningless FPFH -> an arbitrary
+        # transform with ~0 coverage (see the comment above).
+        if not self.params.GLOBAL_SWEEP and (
+                self.params.GLOBAL_NORMAL_R <= self.params.GLOBAL_VOXEL or
                 self.params.GLOBAL_FEATURE_R <= self.params.GLOBAL_VOXEL):
             rospy.logerr("INCOHERENT global-reg scale: normal_r=%.3f / "
                          "feat_r=%.3f are not larger than voxel=%.3f. FPFH will "
@@ -217,8 +263,9 @@ class AlignmentNode(object):
             # scene wants ~0.10m). Too coarse washes the geometry out; too fine
             # explodes memory. Warn rather than fail, since the target's extent
             # is not known yet and the reference alone is only an estimate.
+            # Fixed mode only -- the sweep picks its own scales from the target.
             _rp = self.prepared_ref.ref_raw
-            if len(_rp):
+            if len(_rp) and not self.params.GLOBAL_SWEEP:
                 _extent = float((_rp[:, :2].max(axis=0) - _rp[:, :2].min(axis=0)).max())
                 _suggest = _extent / 200.0
                 if _suggest > 0 and not (_suggest / 3.0 <= self.params.GLOBAL_VOXEL
@@ -240,6 +287,11 @@ class AlignmentNode(object):
         self.frames = []
         self.done = False
         self.target_frame_id = None
+        # accumulation bookkeeping (cloud_cb and the stall timer run on
+        # different threads -> _acc_lock makes "align now" happen exactly once)
+        self._acc_lock = threading.Lock()
+        self._last_msg_stamp = None   # rospy.Time of the newest frame, for TF
+        self._last_rx_wall = None     # time.monotonic() when the newest arrived
 
         # -------- publishers --------
         self.tf_pub = rospy.Publisher(
@@ -274,7 +326,14 @@ class AlignmentNode(object):
             rospy.loginfo("Also listening on %s / %s for Scan Context retrieval.",
                           self.sc_cloud_topic, self.sc_odom_topic)
 
-        rospy.loginfo("Listening on %s — need %d frames.",
+        # End-of-stream watchdog: if the stream stops before num_frames,
+        # align with what was collected. Wall-clock thread, not a rospy.Timer:
+        # with use_sim_time the /clock stops when a bag ends.
+        self._watchdog = threading.Thread(target=self._stall_watchdog)
+        self._watchdog.daemon = True
+        self._watchdog.start()
+
+        rospy.loginfo("Listening on %s -- need %d frames.",
                       self.input_topic, self.num_frames)
 
     def _idle(self):
@@ -334,17 +393,49 @@ class AlignmentNode(object):
         if len(cloud.points) == 0:
             rospy.logwarn_throttle(2.0, "empty cloud frame skipped")
             return
-        self.frames.append(cloud)
-        rospy.loginfo_throttle(
-            1.0, "accumulated %d/%d frames", len(self.frames), self.num_frames)
+        with self._acc_lock:
+            if self.done:
+                return
+            self.frames.append(cloud)
+            self._last_msg_stamp = msg.header.stamp
+            self._last_rx_wall = time.monotonic()
+            n = len(self.frames)
+            rospy.loginfo_throttle(1.0, "accumulated %d/%d frames",
+                                   n, self.num_frames)
+            if n < self.num_frames:
+                return
+            frames, stamp = self._claim_frames()
+        self.run_alignment(frames, stamp)
 
-        if len(self.frames) >= self.num_frames:
-            self.run_alignment(msg.header.stamp)
+    def _claim_frames(self):
+        """Mark accumulation finished and hand back the frames. CALLER MUST
+        HOLD _acc_lock -- the single point that decides 'align now'."""
+        self.done = True
+        frames, self.frames = self.frames, []
+        return frames, self._last_msg_stamp
 
-    def run_alignment(self, stamp):
-        self.done = True   # set first so no re-entrancy from queued callbacks
-        rospy.loginfo("Accumulated %d frames. Aligning...", len(self.frames))
-        target_cloud = accumulate_clouds(self.frames)
+    def _stall_watchdog(self):
+        """If frames have started but none arrived for STREAM_END_SEC (wall
+        time) before num_frames was reached, the stream has ended: align with
+        the frames collected so far."""
+        STREAM_END_SEC = 3.0
+        while not rospy.is_shutdown():
+            time.sleep(0.5)
+            with self._acc_lock:
+                if self.done:
+                    return
+                if (self._last_rx_wall is None or time.monotonic()
+                        - self._last_rx_wall < STREAM_END_SEC):
+                    continue
+                rospy.logwarn("Stream ended after %d/%d frames. Aligning with "
+                              "what we have.", len(self.frames), self.num_frames)
+                frames, stamp = self._claim_frames()
+            self.run_alignment(frames, stamp)
+            return
+
+    def run_alignment(self, frames, stamp):
+        rospy.loginfo("Accumulated %d frames. Aligning...", len(frames))
+        target_cloud = accumulate_clouds(frames)
         rospy.loginfo("Merged target points: %d", len(target_cloud.points))
 
         # -------- Scan Context reference selection (only when enabled) --------
@@ -425,6 +516,11 @@ class AlignmentNode(object):
                       info.get("n_correspondences", -1),
                       cov, rmse, info.get("tx", 0.0), info.get("ty", 0.0),
                       info.get("tz", 0.0))
+        if info.get("path") == "sweep":
+            rospy.loginfo("sweep: chose voxel=%.3f  consensus=%s (%d/%d scales "
+                          "agree)  tried=%s", info["voxel"], info["consensus"],
+                          info["n_agree"], info["n_scales"],
+                          ["%.3f" % v for v in info["voxels_tried"]])
         np.set_printoptions(precision=4, suppress=True)
         rospy.loginfo("T (target -> reference):\n%s", str(T_full))
 
@@ -433,6 +529,17 @@ class AlignmentNode(object):
             rospy.logerr("REFUSING to publish: coverage=%.2f (min %.2f) "
                          "rmse=%.2fm (max %.2fm).",
                          cov, self.min_coverage, rmse, self.max_rmse_m)
+            rospy.loginfo("Done (no publish). Node will idle; Ctrl-C to exit.")
+            self._idle()
+            return
+        # info has no "consensus" key outside sweep mode -> gate not applied
+        if self.require_consensus and info.get("consensus") is False:
+            rospy.logerr("REFUSING to publish: only %d/%d scales agreed (need "
+                         "%d). The scales disagree, so no single answer can be "
+                         "trusted. Check overlap, or set require_consensus: "
+                         "false to publish anyway.", info.get("n_agree", 0),
+                         info.get("n_scales", 0),
+                         self.params.CONSENSUS_MIN_AGREE)
             rospy.loginfo("Done (no publish). Node will idle; Ctrl-C to exit.")
             self._idle()
             return

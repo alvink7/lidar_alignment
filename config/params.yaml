@@ -7,14 +7,14 @@
 #
 # align.launch's args are OPTIONAL command-line overrides only: each is applied
 # after this file and ONLY if you actually pass it, e.g.
-#     roslaunch align.launch num_frames:=120 GLOBAL_VOXEL:=0.75
+#     roslaunch align.launch num_frames:=120 reference_pcd:=/path/map.pcd
 # Leave an arg unset and the value below is what the node uses.
 
 # ---- reference map ----
 # The prior map the target is relocalized INTO (the fixed frame). The node
 # refuses to start if this is unset -- there is deliberately no silent default,
 # because quietly aligning against the wrong map is worse than not starting.
-reference_pcd: "~/catkin_ws/data/maps/droneparkscan.pcd"
+reference_pcd: "~/catkin_ws/maps/reference_jul1.pcd"
 
 # ---- topics & I/O ----
 input_topic: "/cloud_registered"
@@ -26,9 +26,10 @@ reference_frame: "reference_map"
 # target_frame: ""   # leave unset to read from incoming message header
 
 # ---- accumulation ----
-# Number of incoming frames to merge before aligning once.
-# Raise if the first frames are too sparse for a reliable alignment.
-num_frames: 50
+# Number of incoming frames to merge before aligning once. 120 (~12 s at the
+# Livox's 10 Hz) works for both the indoor and outdoor scenes. If the stream
+# ends first, the node aligns with whatever it has collected.
+num_frames: 120
 
 # ---- publish gate ----
 # Refuse to publish a transform that fails these. COVERAGE is the discriminator
@@ -72,6 +73,36 @@ GLOBAL_VOXEL: 0.75        # set for the INDOOR reference_jul1 scene
 # GLOBAL_NORMAL_R: 0.30
 # GLOBAL_FEATURE_R: 0.50
 # GLOBAL_TEASER_NB: 0.20
+
+# ---- multi-scale sweep, voxels chosen automatically from the data ----
+# ON by default. The node registers at a LADDER of voxels and keeps the answer
+# most of them AGREE on, so one unlucky scale (like 0.10 above) is outvoted.
+# While the sweep is on, GLOBAL_VOXEL and the three radii above are NOT used:
+# each scale derives its own radii (x3 normal, x5 feature, x2 TEASER bound).
+GLOBAL_SWEEP: true
+
+# How the ladder is chosen. Leave GLOBAL_VOXELS empty for AUTO: the node finds
+# the voxel that leaves the ACCUMULATED TARGET with ~GLOBAL_TARGET_POINTS points
+# (so it follows the scene size and how dense the stream is), then tries
+# that base voxel times each GLOBAL_AUTO_FACTORS entry. Measured auto ladders:
+#   Jul2 live stream (17m, 660k pts) -> 0.077 0.093 0.109 0.131 0.159
+#   palio2 drone map (188m, 1.15M)   -> 0.690 0.838 0.986 1.183 1.429
+# Good runs left the target with 7k-36k points in BOTH scenes; 12k is mid-range.
+# To pin the ladder instead:  GLOBAL_VOXELS: [0.08, 0.12, 0.15]
+GLOBAL_VOXELS: []
+GLOBAL_TARGET_POINTS: 12000
+GLOBAL_AUTO_FACTORS: [0.7, 0.85, 1.0, 1.2, 1.45]
+GLOBAL_MAX_POINTS: 200000     # skip a scale whose downsampled target or reference
+                              # is bigger (a too-fine voxel on a big map -> OOM)
+GLOBAL_MAX_TILT_DEG: 20.0     # discard candidates tilted more than this; both
+                              # clouds are gravity-aligned, real tilt is < ~10deg
+
+# Two scales AGREE when their rotations differ by < CONSENSUS_ROT_DEG and their
+# translations by < CONSENSUS_TRANS_FACTOR x the larger voxel.
+CONSENSUS_ROT_DEG: 5.0
+CONSENSUS_TRANS_FACTOR: 2.5
+CONSENSUS_MIN_AGREE: 2        # scales that must agree to trust the answer
+require_consensus: true       # refuse to publish if fewer scales agree
 
 # ---- Scan Context (DEPRECATED / disabled) ----
 # The scancontext/ package has been removed from this repo, so enabling this
