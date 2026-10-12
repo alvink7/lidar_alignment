@@ -62,10 +62,10 @@ class LiveResultViz(object):
         rospy.init_node("visualize_live_result")
         self.ref_path = os.path.expanduser(
             rospy.get_param("~reference_pcd",
-                            "~/catkin_ws/maps/reference_jul1.pcd"))
+                            "~/ws_vlio/maps/cubes_ref.pcd"))
         self.tgt_path = os.path.expanduser(
             rospy.get_param("~target_pcd",
-                            "~/catkin_ws/maps/test_target.pcd"))
+                            "~/ws_vlio/maps/cubes_tgt.pcd"))
         self.matrix_topic = rospy.get_param("~matrix_topic",
                                             "/target_to_reference_matrix")
         self.out_dir = os.path.expanduser(str(rospy.get_param("~out_dir", ".")))
