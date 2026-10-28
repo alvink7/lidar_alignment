@@ -3,36 +3,7 @@
 """
 global_register.py
 
-Geometry-only GLOBAL map-to-map registration: given two independently-captured
-maps (e.g. two FAST-LIO2 sessions of a similar site, each zeroed at its own
-launch pose), recover the single rigid transform T_RS that maps the SOURCE map
-into the REFERENCE map's frame -- purely from geometry, no Scan Context, no
-loop closure, no per-keyframe retrieval.
-
-Pipeline (one solve on the FULL clouds):
-
-    voxel downsample -> normals -> FPFH -> mutual-NN correspondences
-      -> TEASER++ (full 6-DOF)  -> GICP refine (coarse -> fine)
-
-Deliberately absent (and why), vs alignment_core.align_target's per-keyframe path:
-  * NO floor-plane levelling. Outdoors there is no reliable floor; both clouds
-    are already gravity-aligned by FAST-LIO. The Z offset between the two maps
-    is a real unknown -- let TEASER solve it, don't assume floors coincide.
-  * NO planar / Z constraint. constrain_planar() forces tilt->0 and z->0. The
-    two FAST-LIO gravity frames disagree by a small real tilt (~2.4deg measured
-    on palio2<->droneparkscan) and the launch altitudes differ; forcing them to
-    zero injects that error. Solve full 6-DOF instead.
-  * NO Scan Context windowing. Global registration works BECAUSE of large-scale
-    distinctive structure; chopping the map into ~0.3s egocentric windows throws
-    exactly that away.
-
-Feature scales are OUTDOOR scale (voxel ~0.75m), driven by one knob
-(AlignParams.GLOBAL_VOXEL); everything else is a multiple of it.
-
-The solver internals (_fpfh / _correspondences / _teaser / _gicp) are imported
-unchanged from alignment_core -- they are correct; only what is fed to them and
-what is wrapped around them changes here. Kept as a SEPARATE file so the old
-levelling/planar path in alignment_core stays available for comparison.
+sanity check alignment without running the node
 
 Usage:
     python3 global_register.py SRC.pcd REF.pcd
