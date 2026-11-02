@@ -38,17 +38,17 @@ import open3d as o3d
 
 # ---- edit this and run with no args to test a transform quickly -----------
 TRANSFORM = """
-[[ 0.026  0.997  0.077 -0.834]
- [-0.998  0.031 -0.059  0.987]
- [-0.061 -0.075  0.995  0.582]
- [ 0.     0.     0.     1.   ]]
+[[ 1.      0.0019 -0.0068  0.0154]
+ [-0.0019  1.      0.0058 -0.0225]
+ [ 0.0068 -0.0058  1.     -0.0039]
+ [ 0.      0.      0.      1.    ]]
 """
 
 REF_COLOR = [0.90, 0.30, 0.20]   # warm red  = reference
 TGT_COLOR = [0.20, 0.55, 0.90]   # blue      = target, transformed
 
-DEFAULT_REF = "~/catkin_ws/maps/reference_jul1.pcd"
-DEFAULT_TGT = "~/catkin_ws/maps/test_target.pcd"
+DEFAULT_REF = "./cubes_ref.pcd"
+DEFAULT_TGT = "./cubes_tgt.pcd"
 
 
 def parse_matrix(text):
