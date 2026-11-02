@@ -8,17 +8,10 @@ what it does to the test target cloud against the reference. No ROS needed --
 just edit the TRANSFORM string below (or pass --matrix / --matrix-file) and
 run.
 
-Why a string parser: the matrix comes out of logs, rospy.loginfo dumps,
-np.array2string, etc. already formatted like
-
     [[ 0.95628644  0.06226999 -0.28572485 14.28591555]
      [-0.21918224  0.79942792 -0.55935154 12.35018126]
      [ 0.19358561  0.59752611  0.77813056 -9.07000091]
      [ 0.          0.          0.          1.        ]]
-
-Re-typing that as a clean np.array(...) literal every time is busywork and
-error-prone. This just strips the brackets and whitespace-splits, so you can
-paste it verbatim.
 
 USAGE
     python3 test_transform.py

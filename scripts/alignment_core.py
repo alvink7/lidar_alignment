@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 alignment_core.py
+
+All z leveling functions you see here are not used in the final logic. Kept as an artifact if reverted to for whatever reason.
 """
 
 import numpy as np
@@ -14,34 +16,24 @@ import small_gicp
 
 
 class AlignParams(object):
-    # ---- Voxel / feature scales (FIXED -- these are the values that worked) ----
+    # Voxel / feature scales (these are the values that worked) 
     ICP_VOXEL        = 0.10      # cloud used for levelling + GICP
     NORMAL_RADIUS    = 0.20      # = ICP_VOXEL * 2
     RANSAC_VOXEL     = 0.30      # cloud used for FPFH
     NORMAL_RADIUS_R  = 0.60      # = RANSAC_VOXEL * 2
     FEATURE_RADIUS_R = 1.50      # = RANSAC_VOXEL * 5
 
-    # ---- TEASER ----
+    # TEASER
     TEASER_NOISE_BOUND = 0.60    # = RANSAC_VOXEL * 2
     TEASER_GNC_FACTOR  = 1.4
     TEASER_MAX_ITER    = 100
 
-    # ---- GICP (coarse then fine) ----
+    # GICP (coarse then fine)
     ICP_DIST_COARSE = 0.5
     ICP_DIST_FINE   = 0.1
     ICP_MAX_ITER    = 50
 
     GROUND_REMOVE_Z = 0.30       
-
-    # ---- Ground-plane levelling ----
-    # FLOOR_MAX_NORMAL_TILT_DEG = 30
-    # MIN_FLOOR_POINTS = 30            
-    # FLOOR_SEARCH_PCT   = 40.0   
-    # FLOOR_SLAB_M       = 0.10  
-    # FLOOR_MIN_SLAB_FRAC = 0.40   
-    # FLOOR_BAND_M       = 0.50 
-    # FLOOR_FIT_ITERS    = 5      
-    # FLOOR_FIT_SIGMA    = 2.5     
 
     # ---- Diagnostic score only (NOT used for any decision) ----
     SCORE_INLIER_DIST = 0.30     # m; a target point within this of the reference
@@ -53,26 +45,17 @@ class AlignParams(object):
     GLOBAL_FEATURE_R = GLOBAL_VOXEL * 5.0   # FPFH patch = a meaningful chunk of scene
     GLOBAL_TEASER_NB = GLOBAL_VOXEL * 2.0   # inlier threshold ~ post-downsample scatter
 
-    # ---- Multi-scale sweep, voxels chosen from the data (see align_target) ----
-    # One voxel can fail by bad luck on a marginal pair (measured: 0.10 gave a
-    # 79deg-tilt solve while 0.08/0.12/0.15 all agreed). With the sweep on,
-    # align_target registers at a ladder of voxels and keeps the answer most
-    # scales AGREE on. GLOBAL_VOXEL and the three radii above then only apply
-    # to the fixed (GLOBAL_SWEEP False) and seeded paths. EDIT IN PARAMS.YAML.
+    # Multi-scale sweep, voxels chosen from the data (see align_target). Overridden by params.yaml
     GLOBAL_SWEEP           = True
     GLOBAL_VOXELS          = None    # explicit ladder, e.g. [0.08, 0.12, 0.15];
-                                     # None/empty -> AUTO from the target cloud
-    GLOBAL_TARGET_POINTS   = 12000   # AUTO: base voxel = the one that leaves the
-                                     # downsampled TARGET with ~this many points
-                                     # (good runs: 7k-36k, indoor AND outdoor)
+    GLOBAL_TARGET_POINTS   = 12000  
     GLOBAL_AUTO_FACTORS    = (0.7, 0.85, 1.0, 1.2, 1.45)  # ladder = base * these
     GLOBAL_MAX_POINTS      = 200000  # skip a scale whose downsampled target or
-                                     # reference exceeds this (too fine -> OOM)
+                                     # reference exceeds this
     GLOBAL_MAX_TILT_DEG    = 20.0    # drop candidates tilted more than this
                                      # (gravity-aligned clouds); None disables
-    CONSENSUS_ROT_DEG      = 5.0     # two scales agree if rotations differ by
-                                     # < this ...
-    CONSENSUS_TRANS_FACTOR = 2.5     # ... and translations by < this * voxel
+    CONSENSUS_ROT_DEG      = 5.0     # two scales agree if rotations differ by this
+    CONSENSUS_TRANS_FACTOR = 2.5     # and translations by < this * voxel
     CONSENSUS_MIN_AGREE    = 2       # scales needed to call it a consensus
 
 
@@ -116,7 +99,7 @@ def constrain_planar(T):
     return out
 
 
-# LEVELLING
+# LEVELLING (DEPRECATED)
 def _floor_seed(z, params):
     """Floor height = the lowest significant horizontal slab. Scanning from the
     bottom and taking the first slab that reaches FLOOR_MIN_SLAB_FRAC."""
@@ -140,7 +123,7 @@ def _floor_seed(z, params):
     idx = int(np.argmax(counts >= thresh))   # lowest slab meeting the threshold
     return float(edges[idx] + slab * 0.5)
 
-
+# DEPRECATED
 def fit_floor_plane(pts, normals, params):
     """Deterministic floor plane z = a*x + b*y + c.
     Returns (a, b, c, floor_pts, n_floor, horizontal_used)."""
@@ -385,11 +368,8 @@ def _xy_extent_m(pcd):
 
 
 def voxel_for_point_count(pcd, n_target, lo=0.005, hi=20.0, iters=24):
-    """Voxel at which voxel_down_sample(pcd) keeps ~n_target points.
-
-    Bisection in log-space (the count falls monotonically as the voxel grows).
-    This is what makes the sweep follow the DATA: it reacts to the scene size
-    and to how densely the stream has accumulated, not to a fixed constant."""
+    # Voxel at which voxel_down_sample(pcd) keeps ~n_target points.
+    
     n_raw = len(pcd.points)
     if n_raw == 0:
         raise ValueError("voxel_for_point_count: empty cloud")
@@ -406,13 +386,7 @@ def voxel_for_point_count(pcd, n_target, lo=0.005, hi=20.0, iters=24):
 
 
 def candidate_voxels(tgt_cloud, ref_cloud, params):
-    """(voxel ladder smallest-first, base voxel or None, how it was chosen).
-
-    GLOBAL_VOXELS set -> used as given. Otherwise AUTO from the streamed
-    target: base = voxel_for_point_count(target, GLOBAL_TARGET_POINTS), and the
-    ladder is base * GLOBAL_AUTO_FACTORS. Calibrated on the good runs, which
-    left the downsampled target with 7k-36k points in BOTH the 17m indoor
-    pair (voxel 0.08-0.15) and the 188m drone pair (voxel 0.5-1.0)."""
+    # (voxel ladder smallest-first, base voxel or None, how it was chosen).
     if params.GLOBAL_VOXELS:
         return (sorted(set(float(v) for v in params.GLOBAL_VOXELS)), None,
                 "explicit GLOBAL_VOXELS")
@@ -499,21 +473,7 @@ def _register_at_voxel(tgt_cloud, ref_cloud, v, normal_r, feat_r, noise_b,
 
 
 def _sweep(tgt_cloud, ref_cloud, params, faiss_res, log):
-    """Register at every candidate voxel, then pick by cross-scale consensus.
-
-    1. run _register_at_voxel at each scale (radii derived x3/x5/x2 per scale,
-       so every scale is internally coherent); skip scales whose downsampled
-       clouds exceed GLOBAL_MAX_POINTS, and scales that raise.
-    2. RE-SCORE every result on ONE common grid (median voxel, inlier distance
-       2x that). Each scale's own coverage uses its own 2*voxel threshold, so
-       coarse scales would look better just for being coarse.
-    3. drop candidates tilted beyond GLOBAL_MAX_TILT_DEG.
-    4. two candidates AGREE if their rotations differ by < CONSENSUS_ROT_DEG
-       and translations by < CONSENSUS_TRANS_FACTOR * the larger voxel. The
-       winning group is the one most candidates agree with (ties -> higher
-       summed common coverage); the answer is that group's best-coverage
-       member. consensus = group size >= CONSENSUS_MIN_AGREE.
-    """
+    # Register at every candidate voxel, then pick by cross-scale consensus.
     p = params
     voxels, base, how = candidate_voxels(tgt_cloud, ref_cloud, p)
     log("scale sweep over voxels %s (%s)" % (["%.3f" % v for v in voxels], how))
@@ -536,7 +496,7 @@ def _sweep(tgt_cloud, ref_cloud, params, faiss_res, log):
         cands.append({"T": T, "info": info, "voxel": float(v)})
 
     if not cands:
-        # Most likely cause when EVERY scale is skipped: the reference is a far
+        # Most likely cause when every scale is skipped: the reference is a far
         # bigger scene than the target (e.g. an indoor stream against an
         # outdoor map), so voxels sized for the target explode the reference.
         ext_t, ext_r = (_xy_extent_m(tgt_cloud), _xy_extent_m(ref_cloud))
@@ -629,16 +589,8 @@ def _sweep(tgt_cloud, ref_cloud, params, faiss_res, log):
 def align_target(tgt_cloud, prepared_ref, params, faiss_res=None, logger=None,
                   init_T=None, skip_teaser=False):
     """Returns (T 4x4 mapping TARGET -> REFERENCE, info).
-
         voxel downsample -> normals -> FPFH -> mutual-NN correspondences
           -> TEASER++ (full 6-DOF)  -> GICP refine (coarse -> fine)
-
-    params.GLOBAL_SWEEP (default True): run that pipeline at a ladder of voxels
-    chosen from the target cloud (or GLOBAL_VOXELS) and keep the cross-scale
-    consensus -- see _sweep. info["consensus"] says whether enough scales
-    agreed. GLOBAL_SWEEP False: one run at GLOBAL_VOXEL with the
-    GLOBAL_NORMAL_R / GLOBAL_FEATURE_R / GLOBAL_TEASER_NB radii, as before.
-    skip_teaser with init_T: one seeded GICP run at GLOBAL_VOXEL (no sweep).
     """
     def log(m):
         if logger:

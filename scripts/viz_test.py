@@ -6,33 +6,6 @@ viz_test.py
 Overlay the reference and the published transform's target, live off
 /target_to_reference_matrix.
 
-WHAT CHANGED vs the original, and why
-    The original could fail in three ways that all look identical from outside
-    -- "it just doesn't come up" -- because each one is silent:
-
-    1. SIM TIME WITH NO CLOCK. rospy.Time.now() returns 0 until something
-       publishes /clock, so under `rosparam set use_sim_time true` with no bag
-       playing, rate.sleep() blocks forever AND the 10 s timeout never fires
-       (it compares two zeros). The node hangs with no output. This is easy to
-       walk into because use_sim_time is sticky on the master -- set it once for
-       a bag replay and it stays set for every node you start afterwards, until
-       roscore restarts. Now: checked up front, and the wait uses WALL time.
-
-    2. NO GL CONTEXT. draw_geometries() cannot create a window when there is no
-       DISPLAY (headless, SSH without -X, broken WSLg) and it returns NORMALLY,
-       without raising and without a window. Now: the window is created
-       explicitly via Visualizer.create_window(), whose return value actually
-       reports failure, and the environment is printed when it does.
-
-    3. A DEGENERATE TRANSFORM. If the matrix arrives all-zero or with NaNs, the
-       transformed cloud has no finite bounding box, the viewer cannot place a
-       camera, and you get an empty or missing window rather than an error.
-       Now: validated before use.
-
-    On any window failure it writes the overlay to disk (a coloured .pcd, plus
-    a PNG if offscreen rendering is available) so the result is still
-    inspectable -- in CloudCompare, or on another machine.
-
 USAGE
     rosrun cloud_aligner viz_test.py \
         _reference_pcd:=$HOME/catkin_ws/maps/reference_upscaled.pcd \
