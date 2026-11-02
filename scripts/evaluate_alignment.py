@@ -311,23 +311,59 @@ def fit_reference(T_A_i, T_M_m, iters=10):
                       "p_lio_M": apply(T_M_A, T_A_i[:, :3, 3])}
 
 
-def ground_truth(ref_odom, ref_moc, tgt_odom, tgt_moc, max_gap=0.1, t_offset=0.0):
+def parse_axes(spec):
+    """'x,z,y' or 'x,-z,y' -> 3x3 S with p_new = S @ p_published."""
+    S = np.zeros((3, 3))
+    for row, tok in enumerate(spec.replace(" ", "").lower().split(",")):
+        sign = -1.0 if tok.startswith("-") else 1.0
+        S[row, "xyz".index(tok.lstrip("+-"))] = sign
+    if sorted(np.abs(S).sum(0)) != [1, 1, 1] or sorted(np.abs(S).sum(1)) != [1, 1, 1]:
+        sys.exit("ERROR: bad --mocap-axes %r (use a permutation like x,z,y)" % spec)
+    return S
+
+
+def _mocap_T(m, S, flip, conj):
+    """Mocap poses with positions remapped by S and rotations per convention."""
+    T = stack(m)
+    T[:, :3, 3] = T[:, :3, 3] @ S.T
+    if flip:
+        T = _flip_rot(T)
+    if conj:
+        T[:, :3, :3] = np.einsum("ij,njk,lk->nil", S, T[:, :3, :3], S)
+    return T
+
+
+def ground_truth(ref_odom, ref_moc, tgt_odom, tgt_moc, max_gap=0.1, t_offset=0.0,
+                 S=np.eye(3)):
     # reference: match odom to mocap
     ok, m = associate(ref_odom["t"], ref_moc, max_gap, t_offset)
     if ok.sum() < 20:
         raise RuntimeError("Only %d reference odom/mocap matches - check clocks / "
                            "--t-offset" % ok.sum())
     T_A_i = stack(subset(ref_odom, ok))
-    T_M_m = stack(subset(m, ok))
+    m = subset(m, ok)
 
-    # mocap quaternion convention: pick the one that makes X constant
+    # does the axis remap actually fit better? (a mirrored trajectory can't be
+    # matched by a rigid transform, so the wrong handedness shows as residual)
+    pA = T_A_i[:, :3, 3]
+    swap_check = {}
+    for name, P in (("as_published", m["p"]), ("remapped", m["p"] @ S.T)):
+        T, _ = umeyama(pA, P)
+        swap_check[name + "_rmse_m"] = float(np.sqrt(np.mean(
+            np.sum((apply(T, pA) - P) ** 2, 1))))
+
+    # quaternion convention: pick the combination that makes X constant
+    remap = not np.allclose(S, np.eye(3))
     fits = {}
-    for conv, Tm in (("body-to-world", T_M_m), ("world-to-body", _flip_rot(T_M_m))):
-        fits[conv] = fit_reference(T_A_i, Tm)
-    conv = min(fits, key=lambda c: np.median(fits[c][2]["dev_rot"]))
-    T_M_A, X, q = fits[conv]
-    flip = conv == "world-to-body"
-    T_M_m_ref0 = (_flip_rot(T_M_m) if flip else T_M_m)[0]
+    for flip in (False, True):
+        for conj in ((False, True) if remap else (False,)):
+            label = ("world-to-body" if flip else "body-to-world") + \
+                    ((", remapped like positions" if conj else ", as published")
+                     if remap else "")
+            fits[label] = ((flip, conj), fit_reference(T_A_i, _mocap_T(m, S, flip, conj)))
+    conv = min(fits, key=lambda c: np.median(fits[c][1][2]["dev_rot"]))
+    (flip, conj), (T_M_A, X, q) = fits[conv]
+    T_M_m_ref0 = _mocap_T(m, S, flip, conj)[0]
 
     # target: average poses over the matched (still) window
     ok, m = associate(tgt_odom["t"], tgt_moc, max_gap, t_offset)
@@ -335,9 +371,7 @@ def ground_truth(ref_odom, ref_moc, tgt_odom, tgt_moc, max_gap=0.1, t_offset=0.0
         raise RuntimeError("Only %d target odom/mocap matches - check clocks / "
                            "--t-offset" % ok.sum())
     T_B_i_all = stack(subset(tgt_odom, ok))
-    T_M_m_all = stack(subset(m, ok))
-    if flip:
-        T_M_m_all = _flip_rot(T_M_m_all)
+    T_M_m_all = _mocap_T(subset(m, ok), S, flip, conj)
     T_B_i = mean_pose(T_B_i_all)
     T_M_mt = mean_pose(T_M_m_all)
     still = {
@@ -354,7 +388,9 @@ def ground_truth(ref_odom, ref_moc, tgt_odom, tgt_moc, max_gap=0.1, t_offset=0.0
     T_gt_noX = inv(T_ref0_M) @ T_M_mt @ inv(T_B_i)
     return {"T_gt": T_gt, "T_M_A": T_M_A, "T_M_B": T_M_B, "X": X, "T_B_i": T_B_i,
             "T_gt_noX": T_gt_noX, "ref": q, "still": still,
-            "mocap_quat_convention": conv}
+            "mocap_quat_convention": conv, "axis_check": swap_check,
+            "start": {"ref_mocap0": T_M_m_ref0, "tgt_mocap": T_M_mt,
+                      "ref_odom0": T_A_i[0], "tgt_odom": T_B_i}}
 
 
 def _flip_rot(Ts):
@@ -536,6 +572,28 @@ def make_figures(res, out, args, pcd):
 # Report
 # --------------------------------------------------------------------------- #
 
+def start_check(res, up):
+    """Raw physical facts, independent of the extrinsic and the axis handling:
+    how far apart / how rotated the two start poses were (mocap), what the aligner
+    and the GT say, and whether each odometry starts at its own origin."""
+    st, gt = res["gt"]["start"], res["gt"]
+    a, b = st["ref_mocap0"], st["tgt_mocap"]
+    dRw = b[:3, :3] @ a[:3, :3].T                       # rotation between starts, world frame
+    _, yaw = tilt_yaw_deg(dRw, up)
+    d_drone = lambda T: float(np.linalg.norm(apply(T, gt["T_B_i"][:3, 3][None])[0]
+                                             - gt["T_B_i"][:3, 3]))
+    return {
+        "mocap_start_distance_m": float(np.linalg.norm(b[:3, 3] - a[:3, 3])),
+        "mocap_start_rotation_deg": rot_deg(dRw), "mocap_start_yaw_deg": yaw,
+        "gt_rotation_deg": rot_deg(gt["T_gt"]), "gt_drone_shift_m": d_drone(gt["T_gt"]),
+        "est_rotation_deg": rot_deg(res["T_est"]), "est_drone_shift_m": d_drone(res["T_est"]),
+        "ref_odom0_from_origin_m": float(np.linalg.norm(st["ref_odom0"][:3, 3])),
+        "ref_odom0_rot_deg": rot_deg(st["ref_odom0"]),
+        "tgt_odom_from_origin_m": float(np.linalg.norm(st["tgt_odom"][:3, 3])),
+        "tgt_odom_rot_deg": rot_deg(st["tgt_odom"]),
+    }
+
+
 def write_reports(res, out, args, pcd):
     al, base, gt = res["aligner"], res["identity"], res["gt"]
     q, st = gt["ref"], gt["still"]
@@ -554,6 +612,31 @@ def write_reports(res, out, args, pcd):
         warnings.append("Extrinsic estimate is inconsistent across the reference flight "
                         "(median %.1f deg). Check clock offset (--t-offset) and that "
                         "/Odometry is the IMU pose." % np.median(q["dev_rot"]))
+    ac = gt["axis_check"]
+    if args.mocap_axes.replace(" ", "") != "x,y,z" and \
+            ac["as_published_rmse_m"] < 0.7 * ac["remapped_rmse_m"]:
+        warnings.append("The mocap positions fit BETTER without the axis remap (%.1f cm vs "
+                        "%.1f cm). The y/z swap is probably not real - rerun with "
+                        "--mocap-axes x,y,z." % (ac["as_published_rmse_m"] * 100,
+                                                 ac["remapped_rmse_m"] * 100))
+    up = np.asarray([float(x) for x in args.up.split(",")])
+    sc = start_check(res, up / np.linalg.norm(up))
+    res["start_check"] = sc
+    if sc["mocap_start_rotation_deg"] > 5 * max(sc["est_rotation_deg"], 1.0) or \
+            sc["mocap_start_distance_m"] > 0.3 + 5 * sc["est_drone_shift_m"]:
+        warnings.append("Mocap says the two starts differ by %.2f m / %.1f deg, but the aligner's "
+                        "transform is only %.2f m / %.1f deg. If each cloud were in its own "
+                        "start frame these would match - check how the PCDs were built "
+                        "(view_raw_clouds.py --odom)."
+                        % (sc["mocap_start_distance_m"], sc["mocap_start_rotation_deg"],
+                           sc["est_drone_shift_m"], sc["est_rotation_deg"]))
+    for nm in ("ref", "tgt"):
+        k = "ref_odom0" if nm == "ref" else "tgt_odom"
+        if sc[k + "_from_origin_m"] > 0.2 or sc[k + "_rot_deg"] > 5:
+            warnings.append("%s odometry does not start at its own origin (%.2f m, %.1f deg): its "
+                            "frame is not the drone's start pose."
+                            % ("Reference" if nm == "ref" else "Target",
+                               sc[k + "_from_origin_m"], sc[k + "_rot_deg"]))
     if st["mocap_pos_std_m"] > 0.02 or st["odom_pos_std_m"] > 0.02:
         warnings.append("Target does not look stationary (mocap std %.1f cm, odom std %.1f cm)."
                         % (st["mocap_pos_std_m"] * 100, st["odom_pos_std_m"] * 100))
@@ -587,6 +670,21 @@ def write_reports(res, out, args, pcd):
         L.append("| No alignment (identity) | %s | %s | %s | %s |"
                  % (cm(b["mean_m"]), cm(b["median_m"]), cm(b["p95_m"]), cm(b["max_m"])))
     L.append("")
+    L.append("## Sanity check: how different were the two starts?\n")
+    L.append("Straight from mocap - unaffected by the extrinsic or axis handling. If each cloud "
+             "is in its own FAST-LIO start frame, the ground truth and a good aligner should "
+             "both be about this size.\n")
+    L.append("| | Shift of drone position | Rotation |\n|---|---|---|")
+    L.append("| Physical start change (mocap) | %s | %.1f° (yaw %+.1f°) |"
+             % (cm(sc["mocap_start_distance_m"]), sc["mocap_start_rotation_deg"],
+                sc["mocap_start_yaw_deg"]))
+    L.append("| Ground truth | %s | %.1f° |" % (cm(sc["gt_drone_shift_m"]), sc["gt_rotation_deg"]))
+    L.append("| Aligner (T_est) | %s | %.1f° |" % (cm(sc["est_drone_shift_m"]), sc["est_rotation_deg"]))
+    L.append("| Reference odometry first pose | %s from origin | %.1f° from identity |"
+             % (cm(sc["ref_odom0_from_origin_m"]), sc["ref_odom0_rot_deg"]))
+    L.append("| Target odometry (mean pose) | %s from origin | %.1f° from identity |"
+             % (cm(sc["tgt_odom_from_origin_m"]), sc["tgt_odom_rot_deg"]))
+    L.append("")
     L.append("## Ground-truth quality\n")
     L.append("| Check | Value |\n|---|---|")
     L.append("| Reference fit residual (RMSE / max) | %s / %s over %d poses |"
@@ -601,6 +699,9 @@ def write_reports(res, out, args, pcd):
     L.append("| Naive GT (raw mocap start poses, extrinsic ignored) differs by | %.2f°, %s |"
              % (ext_effect_rot, cm(ext_effect_tr)))
     L.append("| Mocap quaternion convention (auto-detected) | %s |" % gt["mocap_quat_convention"])
+    ac = gt["axis_check"]
+    L.append("| Mocap axis remap `%s`: reference fit RMSE as published / remapped | %s / %s |"
+             % (args.mocap_axes, cm(ac["as_published_rmse_m"]), cm(ac["remapped_rmse_m"])))
     if warnings:
         L.append("")
         for w in warnings:
@@ -640,8 +741,9 @@ def write_reports(res, out, args, pcd):
               "extrinsic_effect_rot_deg": ext_effect_rot,
               "extrinsic_effect_trans_m": ext_effect_tr,
               "target_stillness": st,
-              "mocap_quat_convention": gt["mocap_quat_convention"]},
-          "warnings": warnings}
+              "mocap_quat_convention": gt["mocap_quat_convention"],
+              "mocap_axes": args.mocap_axes, "axis_check": gt["axis_check"]},
+          "start_check": sc, "warnings": warnings}
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(js, f, indent=2)
     return verdict, warnings
@@ -652,7 +754,8 @@ def write_reports(res, out, args, pcd):
 def run(ref_odom, ref_moc, tgt_odom, tgt_moc, T_est, args, pcd=None):
     up = np.asarray([float(x) for x in args.up.split(",")])
     up /= np.linalg.norm(up)
-    gt = ground_truth(ref_odom, ref_moc, tgt_odom, tgt_moc, args.max_gap, args.t_offset)
+    gt = ground_truth(ref_odom, ref_moc, tgt_odom, tgt_moc, args.max_gap, args.t_offset,
+                      parse_axes(args.mocap_axes))
     res = {"T_est": T_est, "gt": gt,
            "aligner": transform_error(T_est, gt, up, pcd),
            "identity": transform_error(np.eye(4), gt, up, pcd)}
@@ -677,7 +780,11 @@ def main(argv=None):
     ap.add_argument("--max-gap", type=float, default=0.1, help="max mocap gap to interpolate (s)")
     ap.add_argument("--t-offset", type=float, default=0.0,
                     help="added to odom stamps before matching mocap (s)")
-    ap.add_argument("--up", default="0,0,1", help="mocap up axis")
+    ap.add_argument("--mocap-axes", default="x,z,y",
+                    help="remap published mocap axes: new (x,y,z) = these published "
+                         "components. Default x,z,y swaps y and z. Use x,y,z for none, "
+                         "or e.g. x,-z,y for a proper Y-up -> Z-up rotation.")
+    ap.add_argument("--up", default="0,0,1", help="up axis AFTER the remap")
     ap.add_argument("--rot-thresh", type=float, default=1.0, help="deg")
     ap.add_argument("--trans-thresh", type=float, default=0.10, help="m")
     ap.add_argument("--out", default="alignment_eval")
@@ -720,6 +827,13 @@ def main(argv=None):
     print("GT: ref fit RMSE %.1f cm, extrinsic consistency %.2f deg median, mocap quats %s"
           % (np.sqrt(np.mean(q["resid"] ** 2)) * 100, np.median(q["dev_rot"]),
              res["gt"]["mocap_quat_convention"]))
+    sc = res["start_check"]
+    print("Start poses: mocap %.2f m / %.1f deg apart | GT %.2f m / %.1f deg | aligner %.2f m / %.1f deg"
+          % (sc["mocap_start_distance_m"], sc["mocap_start_rotation_deg"], sc["gt_drone_shift_m"],
+             sc["gt_rotation_deg"], sc["est_drone_shift_m"], sc["est_rotation_deg"]))
+    ac = res["gt"]["axis_check"]
+    print("Mocap axes %s: ref fit RMSE %.1f cm as published, %.1f cm remapped"
+          % (args.mocap_axes, ac["as_published_rmse_m"] * 100, ac["remapped_rmse_m"] * 100))
     for w in warnings:
         print("WARNING:", w)
     print("Outputs in %s/" % args.out)
